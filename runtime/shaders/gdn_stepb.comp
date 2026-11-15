@@ -1,0 +1,70 @@
+#version 460
+// S18 stage C: gdn_step.comp for T tokens of a verify batch in ONE dispatch. The thread's 32 state values are read once
+// and stay in registers across the tokens; token t's state goes to so[t] (verify checkpoints; the last = live), its
+// conv / proj / out rows advance by st bytes. Per token the arithmetic is gdn_step.comp's (bit-identical: the state a
+// token reads is exactly the fp32 value the previous token wrote).
+#include "common.glsl"
+layout(local_size_x = 512) in;
+layout(push_constant) uniform PC {
+    uint64_t conv; uint64_t proj; uint64_t state; uint64_t alog; uint64_t dtb; uint64_t normw; uint64_t outp;
+    uint64_t so0; uint64_t so1; uint64_t so2; uint64_t so3; float eps; uint st; uint nt;
+} pc;
+shared float qs[128];
+shared float ks[128];
+shared float part[4][128];
+shared float red[8];
+void main() {
+    const uint h = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x, j = tid & 127u, kq = tid >> 7, kh = h / 3u;
+    F32 S = F32(pc.state);
+    const uint sb = h * 128u * 128u, k0 = kq * 32u;
+    float sr[32];
+    [[unroll]] for (uint i = 0u; i < 32u; ++i) sr[i] = S.v[sb + (k0 + i) * 128u + j];
+    for (uint t = 0u; t < pc.nt; ++t) {
+        const uint64_t off = uint64_t(t) * uint64_t(pc.st);
+        F32 C = F32(pc.conv + off), P = F32(pc.proj + off), O = F32(pc.outp + off);
+        F32 SO = F32(t == 0u ? pc.so0 : t == 1u ? pc.so1 : t == 2u ? pc.so2 : pc.so3);
+        barrier();  // shared arrays of the previous token are consumed
+        float q = 0.0, k = 0.0;
+        if (kq == 0u) { q = C.v[kh * 128u + j]; k = C.v[2048u + kh * 128u + j]; }
+        float sq = subgroupAdd(q * q), sk = subgroupAdd(k * k);
+        if (gl_SubgroupInvocationID == 0u && gl_SubgroupID < 2u) { red[gl_SubgroupID] = sq; red[4u + gl_SubgroupID] = sk; }
+        barrier();
+        if (kq == 0u) {
+            qs[j] = q * inversesqrt(red[0] + red[1] + 1e-6) * inversesqrt(128.0);
+            ks[j] = k * inversesqrt(red[4] + red[5] + 1e-6);
+        }
+        barrier();
+        const float b = P.v[16384u + h], a = P.v[16432u + h];
+        const float x = a + F32(pc.dtb).v[h];
+        const float sp = x > 20.0 ? x : log(1.0 + exp(x));
+        const float decay = exp(-exp(F32(pc.alog).v[h]) * sp);
+        const float beta = 1.0 / (1.0 + exp(-b));
+        float kv = 0.0;
+        [[unroll]] for (uint i = 0u; i < 32u; ++i) kv += sr[i] * ks[k0 + i];
+        part[kq][j] = kv * decay;
+        barrier();
+        const float v = C.v[4096u + h * 128u + j];
+        const float delta = (v - (part[0][j] + part[1][j] + part[2][j] + part[3][j])) * beta;
+        barrier();
+        float o = 0.0;
+        [[unroll]] for (uint i = 0u; i < 32u; ++i) {
+            const uint kk = k0 + i;
+            const float s = sr[i] * decay + ks[kk] * delta;
+            SO.v[sb + kk * 128u + j] = s;
+            sr[i] = s;
+            o += s * qs[kk];
+        }
+        part[kq][j] = o;
+        barrier();
+        o = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+        float so = kq == 0u ? o * o : 0.0;
+        so = subgroupAdd(so);
+        if (gl_SubgroupInvocationID == 0u && gl_SubgroupID < 2u) red[gl_SubgroupID] = so;
+        barrier();
+        if (kq == 0u) {
+            const float r = inversesqrt((red[0] + red[1]) / 128.0 + pc.eps);
+            const float z = P.v[10240u + h * 128u + j];
+            O.v[h * 128u + j] = o * r * F32(pc.normw).v[j] / (1.0 + exp(-z));
+        }
+    }
+}

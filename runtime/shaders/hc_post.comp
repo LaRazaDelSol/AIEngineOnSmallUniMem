@@ -1,0 +1,12 @@
+#version 460
+// hidden = hyper_input + y (x) inj : H[c*H+i] += y[i] * inj[c]  (H is the un-normalised stream state).
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t h; uint64_t y; uint64_t inj; uint C; } pc;
+void main() {
+    const uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.C * HIDDEN) return;
+    const uint c = j / HIDDEN, i = j - c * HIDDEN;
+    F32 Hs = F32(pc.h);
+    Hs.v[j] += F32(pc.y).v[i] * F32(pc.inj).v[c];
+}

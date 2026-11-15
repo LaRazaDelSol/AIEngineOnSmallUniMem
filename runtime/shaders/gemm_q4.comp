@@ -1,0 +1,129 @@
+#version 460
+// S21 wide prefill: dense PS5Q4 GEMM over the token dimension, Y[t][r] = epi(alpha * sum_k W[r][k] X[t][k]).
+// The S18-S20 prefill ran T <= 4 matvecs (weights re-read every 4 tokens: bandwidth/latency bound, ~200 GB/s on inproj).
+// Here one workgroup owns a 128-row x 64-token tile: per 32-wide K step the 128 rows' quant block is dequantised ONCE into
+// LDS (fp32, d * (q - 8)) and reused by 64 tokens, the X slice is staged transposed, each thread accumulates an 8 x 4
+// register tile (3 ds_read_b128 per 32 FMAs). The next step's quant words / x are fetched into registers before the
+// current step computes (one LDS buffer, two barriers per step). fp32 accumulate: NOT bit-identical to the matvecs (the
+// sum order differs), relative error ~1e-6 (gemm_bench checks it).
+// mode: 0 store, 1 accumulate (Y += o), 2 silu, 3 sigmoid. Rows >= N / tokens >= T are guarded. K % 32 == 0.
+// Optional row map (rmap != 0): output row r reads weight row U32(rmap)[r].
+// Split-K (ks > 1, grid z = ks, (K/32) % ks == 0): workgroup z covers K steps [z nk/ks, (z+1) nk/ks) and writes RAW partials
+// to y + (z*T + t)*ys (w_ksum.comp reduces them and applies alpha / mode): thin matrices (HC down 320 x 10240).
+// -DWBF16: bf16 weight rows (K * 2 bytes, the router), same tiling.
+#define BITS 4
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t w; uint64_t x; uint64_t y; uint K; uint N; uint T; uint mode; float alpha; uint xs; uint ys; uint ks; uint64_t rmap;
+} pc;
+const uint BM = 128u, BN = 64u, BK = 32u;
+shared float Ws[BK * BM];   // [k][row]
+shared float Xs[BK * BN];   // [k][token]
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint row0 = gl_WorkGroupID.x * BM, tok0 = gl_WorkGroupID.y * BN;
+#ifdef WBF16
+    const uint RB = pc.K * 2u;                  // row bytes
+#else
+    const uint SW = scale_words(pc.K), RW = row_words(pc.K);
+    const uint RB = RW * 4u;
+#endif
+    // loader roles: W: row lr = tid >> 1, half h = tid & 1 of the 32-weight step (Q4: quant words 2h, 2h+1; bf16: elems
+    // 16h..16h+15); X: token lt = tid >> 2, floats 8 (tid & 3) .. +7 of the K step
+    const uint lr = tid >> 1u, h = tid & 1u, lt = tid >> 2u, lk = (tid & 3u) * 8u;
+    const uint gr = row0 + lr;
+    const bool rok = gr < pc.N;
+    uint wr = gr;
+    if (pc.rmap != 0ul && rok) wr = U32(pc.rmap).v[gr];
+    const uint64_t rp = pc.w + uint64_t(rok ? wr : 0u) * uint64_t(RB);
+    const bool tok_ok = tok0 + lt < pc.T;
+    const uint64_t xp = pc.x + uint64_t(tok_ok ? tok0 + lt : 0u) * uint64_t(pc.xs) + uint64_t(lk * 4u);
+    // compute roles: rows tr*4..+3 and 64+tr*4..+3, tokens tc*4..+3
+    const uint tr = tid & 15u, tc = tid >> 4u;
+    float acc[8][4];
+    [[unroll]] for (uint i = 0u; i < 8u; ++i) [[unroll]] for (uint j = 0u; j < 4u; ++j) acc[i][j] = 0.0;
+    const uint nkt = pc.K / BK, ks = max(pc.ks, 1u), z = gl_WorkGroupID.z;
+    const uint kb0 = z * (nkt / ks), kb1 = ks > 1u ? kb0 + nkt / ks : nkt;
+#ifdef WBF16
+    uint wq[8];
+    [[unroll]] for (uint i = 0u; i < 8u; ++i) wq[i] = rok ? U32(rp + uint64_t((kb0 * BK + 16u * h) * 2u + 4u * i)).v[0] : 0u;
+#else
+    uint q0 = 0u, q1 = 0u, sw = 0u;
+    if (rok) {
+        q0 = U32(rp + uint64_t((SW + kb0 * QWPB + 2u * h) * 4u)).v[0];
+        q1 = U32(rp + uint64_t((SW + kb0 * QWPB + 2u * h + 1u) * 4u)).v[0];
+        sw = U32(rp + uint64_t((kb0 >> 1) * 4u)).v[0];
+    }
+#endif
+    vec4 xa = vec4(0.0), xb = vec4(0.0);
+    if (tok_ok) { xa = V4(xp + uint64_t(kb0 * BK * 4u)).v[0]; xb = V4(xp + uint64_t(kb0 * BK * 4u + 16u)).v[0]; }
+    for (uint kb = kb0; kb < kb1; ++kb) {
+        {
+#ifdef WBF16
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                Ws[(16u * h + 2u * i) * BM + lr] = uintBitsToFloat(wq[i] << 16);
+                Ws[(16u * h + 2u * i + 1u) * BM + lr] = uintBitsToFloat(wq[i] & 0xFFFF0000u);
+            }
+#else
+            // dequantise this thread's 16 weights: word j holds elems 4j..4j+3 (low nibbles) and 4j+16..4j+19 (high)
+            const vec2 s2 = unpackHalf2x16(sw);
+            const float d = (kb & 1u) != 0u ? s2.y : s2.x;
+            [[unroll]] for (uint wi = 0u; wi < 2u; ++wi) {
+                const uint q = wi == 0u ? q0 : q1;
+                const uint j = 2u * h + wi;
+                [[unroll]] for (uint b = 0u; b < 4u; ++b) {
+                    const uint by = (q >> (8u * b)) & 0xFFu;
+                    Ws[(4u * j + b) * BM + lr] = d * (float(by & 15u) - 8.0);
+                    Ws[(4u * j + b + 16u) * BM + lr] = d * (float(by >> 4) - 8.0);
+                }
+            }
+#endif
+            Xs[(lk + 0u) * BN + lt] = xa.x; Xs[(lk + 1u) * BN + lt] = xa.y; Xs[(lk + 2u) * BN + lt] = xa.z; Xs[(lk + 3u) * BN + lt] = xa.w;
+            Xs[(lk + 4u) * BN + lt] = xb.x; Xs[(lk + 5u) * BN + lt] = xb.y; Xs[(lk + 6u) * BN + lt] = xb.z; Xs[(lk + 7u) * BN + lt] = xb.w;
+        }
+        barrier();
+        // prefetch the next K step (overlaps the FMAs below)
+        if (kb + 1u < kb1) {
+            const uint nb = kb + 1u;
+#ifdef WBF16
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) wq[i] = rok ? U32(rp + uint64_t((nb * BK + 16u * h) * 2u + 4u * i)).v[0] : 0u;
+#else
+            if (rok) {
+                const uint qo = (SW + nb * QWPB + 2u * h) * 4u;
+                q0 = U32(rp + uint64_t(qo)).v[0];
+                q1 = U32(rp + uint64_t(qo + 4u)).v[0];
+                sw = U32(rp + uint64_t((nb >> 1) * 4u)).v[0];
+            }
+#endif
+            if (tok_ok) { xa = V4(xp + uint64_t(nb * BK * 4u)).v[0]; xb = V4(xp + uint64_t(nb * BK * 4u + 16u)).v[0]; }
+        }
+        [[unroll]] for (uint k = 0u; k < BK; ++k) {
+            const vec4 wa = vec4(Ws[k * BM + tr * 4u], Ws[k * BM + tr * 4u + 1u], Ws[k * BM + tr * 4u + 2u], Ws[k * BM + tr * 4u + 3u]);
+            const vec4 wb = vec4(Ws[k * BM + 64u + tr * 4u], Ws[k * BM + 64u + tr * 4u + 1u], Ws[k * BM + 64u + tr * 4u + 2u], Ws[k * BM + 64u + tr * 4u + 3u]);
+            const vec4 xv = vec4(Xs[k * BN + tc * 4u], Xs[k * BN + tc * 4u + 1u], Xs[k * BN + tc * 4u + 2u], Xs[k * BN + tc * 4u + 3u]);
+            [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+                acc[0][j] = fma(wa.x, xv[j], acc[0][j]); acc[1][j] = fma(wa.y, xv[j], acc[1][j]);
+                acc[2][j] = fma(wa.z, xv[j], acc[2][j]); acc[3][j] = fma(wa.w, xv[j], acc[3][j]);
+                acc[4][j] = fma(wb.x, xv[j], acc[4][j]); acc[5][j] = fma(wb.y, xv[j], acc[5][j]);
+                acc[6][j] = fma(wb.z, xv[j], acc[6][j]); acc[7][j] = fma(wb.w, xv[j], acc[7][j]);
+            }
+        }
+        barrier();
+    }
+    [[unroll]] for (uint j = 0u; j < 4u; ++j) {
+        const uint t = tok0 + tc * 4u + j;
+        if (t >= pc.T) continue;
+        F32 Y = F32(pc.y + uint64_t(ks > 1u ? z * pc.T + t : t) * uint64_t(pc.ys));
+        [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+            const uint r = row0 + (i < 4u ? tr * 4u + i : 64u + tr * 4u + i - 4u);
+            if (r >= pc.N) continue;
+            if (ks > 1u) { Y.v[r] = acc[i][j]; continue; }
+            const float a = acc[i][j] * pc.alpha;
+            float o = a;
+            if (pc.mode == 2u) o = a / (1.0 + exp(-a));
+            else if (pc.mode == 3u) o = 1.0 / (1.0 + exp(-a));
+            if (pc.mode == 1u) Y.v[r] += o; else Y.v[r] = o;
+        }
+    }
+}

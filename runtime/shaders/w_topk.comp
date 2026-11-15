@@ -1,0 +1,40 @@
+#version 460
+// S21 wide prefill: topk.comp for T tokens (grid (1, T)): logits + t*ls, mailbox + t*ms. Same arithmetic per token.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_ballot : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer Mail { uint ids[16]; float w[16]; uint seq; };
+layout(push_constant) uniform PC { uint64_t logits; uint64_t mail; uint n_exp; uint k; uint seq; uint ls; uint ms; uint pad; } pc;
+void main() {
+    const uint lane = gl_SubgroupInvocationID, tk = gl_WorkGroupID.y;
+    float v[8];
+    F32 L = F32(pc.logits + uint64_t(tk) * uint64_t(pc.ls));
+    float m = -1e30;
+    [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+        uint ix = lane + 64u * i;
+        v[i] = ix < pc.n_exp ? L.v[ix] : -1e30;
+        m = max(m, v[i]);
+    }
+    m = subgroupMax(m);
+    float wsum = 0.0;
+    float wk[16];
+    uint idk[16];
+    for (uint k = 0u; k < pc.k; ++k) {
+        float best = -1e30;
+        uint bi = 0xFFFFFFFFu;
+        [[unroll]] for (uint i = 0u; i < 8u; ++i) if (v[i] > best) { best = v[i]; bi = lane + 64u * i; }
+        float gb = subgroupMax(best);
+        uint gi = subgroupMin(best == gb ? bi : 0xFFFFFFFFu);
+        [[unroll]] for (uint i = 0u; i < 8u; ++i) if (lane + 64u * i == gi) v[i] = -1e30;
+        float p = exp(gb - m);
+        idk[k] = gi;
+        wk[k] = p;
+        wsum += p;
+    }
+    if (lane == 0u) {
+        Mail M = Mail(pc.mail + uint64_t(tk) * uint64_t(pc.ms));
+        for (uint k = 0u; k < pc.k; ++k) { M.ids[k] = idk[k]; M.w[k] = wk[k] / wsum; }
+        memoryBarrierBuffer();
+        M.seq = pc.seq;
+    }
+}

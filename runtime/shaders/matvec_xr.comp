@@ -1,0 +1,51 @@
+#version 460
+// Dense PS5Q4 matvec with x held in REGISTERS (compile-time KDIM): each lane loads the activations for its
+// quant words once, then streams `rpw` rows. Cache traffic for x drops from ~8x the weight bytes (matvec.comp)
+// to ~K*4 bytes per wave. y[r] (+)= act(alpha * W[r] . x).  mode: 0 store, 1 accumulate, 2 silu, 3 sigmoid.
+#define BITS 4
+#include "common.glsl"
+#ifndef KDIM
+#define KDIM 2560
+#endif
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint64_t w; uint64_t x; uint64_t y; uint K; uint N; uint rpw; uint mode; float alpha; } pc;
+const uint QW = (KDIM / 32u) * QWPB;
+const uint ITERS = (QW + 63u) / 64u;
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint SW = scale_words(KDIM), RW = row_words(KDIM);
+    U32 W = U32(pc.w);
+    V4 X = V4(pc.x);
+    F32 Y = F32(pc.y);
+    float xv[ITERS][8];
+    float sx[ITERS];
+    [[unroll]] for (uint it = 0u; it < ITERS; ++it) {
+        const uint w = lane + 64u * it;
+        float t[16];
+        if (w < QW) load_x(X, w, t, sx[it]); else { sx[it] = 0.0; [[unroll]] for (uint v = 0u; v < 16u; ++v) t[v] = 0.0; }
+        [[unroll]] for (uint v = 0u; v < 8u; ++v) xv[it][v] = t[v];
+    }
+    const uint r0 = gl_WorkGroupID.x * pc.rpw;
+    for (uint rr = 0u; rr < pc.rpw; ++rr) {
+        const uint r = r0 + rr;
+        if (r >= pc.N) break;
+        const uint rb = r * RW;
+        float acc = 0.0;
+        [[unroll]] for (uint it = 0u; it < ITERS; ++it) {
+            const uint w = lane + 64u * it;
+            if (w < QW) {
+                const uint q = W.v[rb + SW + w];
+                float s = 0.0;
+                [[unroll]] for (uint v = 0u; v < 8u; ++v) s += qval(q, v) * xv[it][v];
+                acc += block_scale(W, rb, w) * (s - ZERO * sx[it]);
+            }
+        }
+        acc = subgroupAdd(acc) * pc.alpha;
+        if (lane == 0u) {
+            float o = acc;
+            if (pc.mode == 2u) o = acc / (1.0 + exp(-acc));
+            else if (pc.mode == 3u) o = 1.0 / (1.0 + exp(-acc));
+            if (pc.mode == 1u) Y.v[r] += o; else Y.v[r] = o;
+        }
+    }
+}

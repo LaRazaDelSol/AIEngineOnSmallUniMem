@@ -1,0 +1,162 @@
+#version 460
+// Qwen4ExpTextAttention decode prep. qkv = [q_proj (24 heads x [256 q | 256 gate]) | k (2 x 256) | v (2 x 256)].
+// q_norm / k_norm (1+w) over 256, partial RoPE on the first 64 dims (rotate_half within 64,
+// inv_freq = theta^(-2i/64)), K/V appended to the cache at pos. WG per head: 0..23 query, 24..25 kv.
+#include "common.glsl"
+#ifdef KV16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer H16 { float16_t v[]; };
+#endif
+#ifdef KVQ   // S20 quantized KV (Strata's int8 / k8v4; SAW-INT4 rotated 4-bit): rows = data + 16 B tail (fp32 scale)
+//   K: int8 per (pos, kv head), absmax/127, row 272 B (68 words). V: KVQ 8 -> int8 like K; KVQ 4 -> 256-point
+//   Walsh-Hadamard rotation (orthonormal, /16) then int4 absmax/7 (+8), row 144 B (36 words). attn_combine rotates back.
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer W32 { uint v[]; };
+shared int qb[256];
+shared float hv[256];
+shared float redm[8];
+float wg_max(float a) {
+    const float m = subgroupMax(a);
+    barrier();
+    if (gl_SubgroupInvocationID == 0u) redm[gl_SubgroupID] = m;
+    barrier();
+    float r = 0.0;
+    for (uint t = 0u; t < gl_NumSubgroups; ++t) r = max(r, redm[t]);
+    return r;
+}
+void put8(uint64_t base, uint row, float x, uint i) {   // row in words (68 per row): 64 data words + scale
+    const float am = wg_max(abs(x));
+    const float sc = am > 0.0 ? am / 127.0 : 1.0;
+    qb[i] = int(clamp(round(x / sc), -127.0, 127.0));
+    barrier();
+    W32 R = W32(base);
+    if (i < 64u) R.v[row + i] = (uint(qb[4u * i]) & 255u) | ((uint(qb[4u * i + 1u]) & 255u) << 8) | ((uint(qb[4u * i + 2u]) & 255u) << 16) |
+                                ((uint(qb[4u * i + 3u]) & 255u) << 24);
+    if (i == 64u) R.v[row + 64u] = floatBitsToUint(sc);
+    barrier();
+}
+#if KVQ == 2   // k4v4 (KV-footprint work): K and V both 256-point Walsh-Hadamard rotated (orthonormal, /16; the query gets the
+//   same rotation, so q.k is unchanged), then 16-level uniform midrise codes, step 0.3352 x the row's RMS (the MSE-optimal
+//   uniform step for Gaussian data, which rotated rows are): value = (code - 7.5) * step. Row 33 words = 132 B
+//   (32 words of codes, element 8w + j in nibble j of word w, + the fp32 step). Was: K int8 272 B, V absmax int4 144 B.
+float wg_sum(float a) {
+    const float m = subgroupAdd(a);
+    barrier();
+    if (gl_SubgroupInvocationID == 0u) redm[gl_SubgroupID] = m;
+    barrier();
+    float r = 0.0;
+    for (uint t = 0u; t < gl_NumSubgroups; ++t) r += redm[t];
+    return r;
+}
+float fwht(float v, uint i) {   // orthonormal 256-point Walsh-Hadamard of the workgroup's values, thread i -> element i
+    barrier();
+    hv[i] = v;
+    for (uint h = 1u; h < 256u; h <<= 1u) {
+        barrier();
+        if ((i & h) == 0u) { const float a = hv[i], b = hv[i + h]; hv[i] = a + b; hv[i + h] = a - b; }
+    }
+    barrier();
+    return hv[i] * 0.0625;
+}
+void put4(uint64_t base, uint row, float v, uint i) {   // v already rotated; row in words (33 per row)
+    const float rms = sqrt(wg_sum(v * v) / 256.0);
+    const float st = rms > 0.0 ? 0.3352 * rms : 1.0;
+    qb[i] = clamp(int(floor(v / st + 8.0)), 0, 15);
+    barrier();
+    W32 R = W32(base);
+    if (i < 32u) {
+        uint w = 0u;
+        for (uint j = 0u; j < 8u; ++j) w |= uint(qb[8u * i + j]) << (4u * j);
+        R.v[row + i] = w;
+    }
+    if (i == 32u) R.v[row + 32u] = floatBitsToUint(st);
+    barrier();
+}
+#endif
+#endif
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t qkv; uint64_t qnw; uint64_t knw; uint64_t qout; uint64_t gout; uint64_t kcache; uint64_t vcache;
+    uint64_t params; float eps; float theta;
+#ifdef WIDE   // S21 wide prefill: grid (26, T), token t at qkv + t*qs, q/gate out + t*os, position pos0 + t
+    uint qs; uint os; uint pos0; uint pad;
+#endif
+} pc;
+shared float vals[256];
+shared float red[4];
+void main() {
+    const uint hd = gl_WorkGroupID.x, i = gl_LocalInvocationID.x;
+#ifdef WIDE
+    const uint tw = gl_WorkGroupID.y;
+    F32 QKV = F32(pc.qkv + uint64_t(tw) * uint64_t(pc.qs));
+    const uint pos = pc.pos0 + tw;
+    const uint64_t qout = pc.qout + uint64_t(tw) * uint64_t(pc.os), gout = pc.gout + uint64_t(tw) * uint64_t(pc.os);
+#else
+    F32 QKV = F32(pc.qkv);
+    const uint pos = U32(pc.params).v[0];
+    const uint64_t qout = pc.qout, gout = pc.gout;
+#endif
+    const bool isq = hd < 24u;
+    const uint kvh = hd - 24u;
+    float x = isq ? QKV.v[hd * 512u + i] : QKV.v[12288u + kvh * 256u + i];
+    float s = subgroupAdd(x * x);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = s;
+    barrier();
+    float tot = 0.0;
+    for (uint t = 0u; t < gl_NumSubgroups; ++t) tot += red[t];
+    const float w = isq ? F32(pc.qnw).v[i] : F32(pc.knw).v[i];
+    x = x * inversesqrt(tot / 256.0 + pc.eps) * (1.0 + w);
+    vals[i] = x;
+    barrier();
+    if (i < 64u) {
+        const uint f = i & 31u;
+        const float ang = float(pos) * pow(pc.theta, -float(2u * f) / 64.0);
+        const float c = cos(ang), sn = sin(ang);
+        x = i < 32u ? x * c - vals[i + 32u] * sn : x * c + vals[i - 32u] * sn;
+    }
+    if (isq) {
+#if defined(KVQ) && KVQ == 2
+        x = fwht(x, i);   // the query in the keys' rotated basis
+#endif
+        F32(qout).v[hd * 256u + i] = x;
+        F32(gout).v[hd * 256u + i] = QKV.v[hd * 512u + 256u + i];
+    } else {
+#if defined(KVQ) && KVQ == 2
+        const uint r = pos * 2u + kvh;
+        put4(pc.kcache, r * 33u, fwht(x, i), i);
+        put4(pc.vcache, r * 33u, fwht(QKV.v[12800u + kvh * 256u + i], i), i);
+#elif defined(KVQ)
+        const uint r = pos * 2u + kvh;
+        put8(pc.kcache, r * 68u, x, i);
+        float v = QKV.v[12800u + kvh * 256u + i];
+#if KVQ == 4
+        hv[i] = v;
+        for (uint h = 1u; h < 256u; h <<= 1u) {   // in-place FWHT
+            barrier();
+            if ((i & h) == 0u) { const float a = hv[i], b = hv[i + h]; hv[i] = a + b; hv[i + h] = a - b; }
+        }
+        barrier();
+        v = hv[i] * 0.0625;
+        const float am = wg_max(abs(v));
+        const float sc = am > 0.0 ? am / 7.0 : 1.0;
+        qb[i] = int(clamp(round(v / sc), -7.0, 7.0)) + 8;
+        barrier();
+        W32 R = W32(pc.vcache);
+        const uint row = r * 36u;
+        if (i < 32u) {
+            uint w = 0u;
+            for (uint j = 0u; j < 8u; ++j) w |= uint(qb[8u * i + j]) << (4u * j);
+            R.v[row + i] = w;
+        }
+        if (i == 32u) R.v[row + 32u] = floatBitsToUint(sc);
+#else
+        put8(pc.vcache, r * 68u, v, i);
+#endif
+#elif defined(KV16)   // S19: fp16 KV cache (long context)
+        H16(pc.kcache).v[(pos * 2u + kvh) * 256u + i] = float16_t(x);
+        H16(pc.vcache).v[(pos * 2u + kvh) * 256u + i] = float16_t(QKV.v[12800u + kvh * 256u + i]);
+#else
+        F32(pc.kcache).v[(pos * 2u + kvh) * 256u + i] = x;
+        F32(pc.vcache).v[(pos * 2u + kvh) * 256u + i] = QKV.v[12800u + kvh * 256u + i];
+#endif
+    }
+}

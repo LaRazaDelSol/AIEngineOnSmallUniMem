@@ -1,0 +1,21 @@
+#version 460
+// logits[r] = Wr[r] . x  (Wr bf16 [E][HIDDEN], resident; moe_decode/vk_kernel_test use router_f32). One wave64 per row.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint64_t w; uint64_t x; uint64_t logits; uint n_exp; } pc;
+void main() {
+    const uint r = gl_WorkGroupID.x, lane = gl_SubgroupInvocationID;
+    if (r >= pc.n_exp) return;
+    // Wr is bf16 (S14): 4 weights = 2 words; bf16 -> f32 is exact (bits << 16), so the sum is bit-identical
+    // to the old f32 copy while reading half the bytes.
+    U32 W = U32(pc.w + uint64_t(r) * uint64_t(HIDDEN * 2u));
+    V4 X = V4(pc.x);
+    float acc = 0.0;
+    for (uint i = lane; i < HIDDEN / 4u; i += 64u) {
+        const uint a = W.v[2u * i], b = W.v[2u * i + 1u];
+        const vec4 w = vec4(uintBitsToFloat(a << 16), uintBitsToFloat(a & 0xFFFF0000u), uintBitsToFloat(b << 16), uintBitsToFloat(b & 0xFFFF0000u));
+        acc += dot(w, X.v[i]);
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0u) F32(pc.logits).v[r] = acc;
+}

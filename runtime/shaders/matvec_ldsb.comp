@@ -1,0 +1,75 @@
+#version 460
+// S18 stage C: matvec_lds.comp for NB token columns (weights read once per row for all columns).
+// x is staged in LDS in KS slices (KS = 2 for NB = 2: 2 x 3072 x 4 B = 24 KB, the single-token kernel's footprint, so the
+// occupancy is unchanged; the S18 first cut staged all 48 KB and ran 83 us vs 31 us single). Each lane still visits its
+// quant words in ascending order across the slices, so every column's sum is matvec_lds.comp's (bit-identical).
+#define BITS 4
+#include "common.glsl"
+#ifndef KDIM
+#define KDIM 6144
+#endif
+#ifndef NB
+#define NB 2
+#endif
+#ifndef KS
+#define KS NB
+#endif
+#ifndef RPW_MAX
+#define RPW_MAX 4
+#endif
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t w; uint64_t x; uint64_t y; uint K; uint N; uint rpw; uint mode; float alpha; uint xs; uint ys; uint nb; } pc;
+const uint KSL = KDIM / KS;            // floats per slice
+shared vec4 xsh[NB][KSL / 4];
+const uint QW = (KDIM / 32u) * QWPB;   // quant words per row
+const uint QWS = QW / KS;              // per slice (a multiple of 64 for 6144 / 2)
+void main() {
+    const uint lane = gl_SubgroupInvocationID, wave = gl_SubgroupID, nw = gl_NumSubgroups;
+    const uint SW = scale_words(KDIM), RW = row_words(KDIM);
+    U32 W = U32(pc.w);
+    const uint r0 = gl_WorkGroupID.x * pc.rpw;
+    float acc[RPW_MAX][NB];
+    [[unroll]] for (uint i = 0u; i < RPW_MAX; ++i) [[unroll]] for (uint c = 0u; c < NB; ++c) acc[i][c] = 0.0;
+    for (uint ks = 0u; ks < KS; ++ks) {
+        barrier();
+        [[unroll]] for (uint c = 0u; c < NB; ++c) {
+            V4 X = V4(pc.x + uint64_t(c) * uint64_t(pc.xs) + uint64_t(ks) * uint64_t(KSL * 4u));
+            for (uint i = gl_LocalInvocationID.x; i < KSL / 4u; i += 256u) xsh[c][i] = X.v[i];
+        }
+        barrier();
+        [[unroll]] for (uint i = 0u; i < RPW_MAX; ++i) {
+            const uint rr = wave + i * nw;
+            const uint r = r0 + rr;
+            if (rr >= pc.rpw || r >= pc.N) break;
+            const uint rb = r * RW;
+            for (uint w = ks * QWS + lane; w < (ks + 1u) * QWS; w += 64u) {
+                const uint b = w >> 2, j = w & 3u;
+                const uint bl = b - ks * (QWS >> 2);   // block index inside the slice (8 vec4 per block)
+                const uint q = W.v[rb + SW + w];
+                const float bs = block_scale(W, rb, w);
+                [[unroll]] for (uint c = 0u; c < NB; ++c) {
+                    const vec4 lo = xsh[c][bl * 8u + j], hi = xsh[c][bl * 8u + 4u + j];
+                    float s = qval(q, 0u) * lo.x + qval(q, 1u) * lo.y + qval(q, 2u) * lo.z + qval(q, 3u) * lo.w
+                            + qval(q, 4u) * hi.x + qval(q, 5u) * hi.y + qval(q, 6u) * hi.z + qval(q, 7u) * hi.w;
+                    const float sx = lo.x + lo.y + lo.z + lo.w + hi.x + hi.y + hi.z + hi.w;
+                    acc[i][c] += bs * (s - ZERO * sx);
+                }
+            }
+        }
+    }
+    [[unroll]] for (uint i = 0u; i < RPW_MAX; ++i) {
+        const uint rr = wave + i * nw;
+        const uint r = r0 + rr;
+        if (rr >= pc.rpw || r >= pc.N) break;
+        [[unroll]] for (uint c = 0u; c < NB; ++c) {
+            const float a = subgroupAdd(acc[i][c]) * pc.alpha;
+            if (lane == 0u) {
+                F32 Y = F32(pc.y + uint64_t(c) * uint64_t(pc.ys));
+                float o = a;
+                if (pc.mode == 2u) o = a / (1.0 + exp(-a));
+                else if (pc.mode == 3u) o = 1.0 / (1.0 + exp(-a));
+                if (pc.mode == 1u) Y.v[r] += o; else Y.v[r] = o;
+            }
+        }
+    }
+}

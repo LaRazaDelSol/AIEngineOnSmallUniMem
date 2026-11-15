@@ -1,0 +1,107 @@
+#version 460
+// S18 stage C: exl3_xmv.comp over the UNIQUE experts of a verify batch. Entry z = one expert slot + the n <= NB
+// (token, k) pairs routed to it; each trellis tile is decoded once and applied to every pair's x. Per pair the
+// accumulation order is exl3_xmv.comp's (PIPE2 and NOPIPE share it), so every output is bit-identical to the
+// single-token kernel. Pair (t, k): x at xin + t*tstride + (k*xs_e + m*xs_m) floats, out likewise with os_e / os_m.
+#include "exl3_common.glsl"
+#ifndef NB
+#define NB 4
+#endif
+layout(local_size_x = 32) in;
+layout(push_constant) uniform PC {
+    uint64_t ents; uint64_t xin; uint64_t out_addr;
+    uint kt; uint nt; uint tr_off0; uint tr_off1;
+    uint xs_e; uint xs_m; uint os_e; uint os_m;
+    uint tstride; uint pad;
+} pc;
+// entry (32 B, host-written into GPU-uncached control memory): slot | n | tk[4] = token << 8 | k | pad
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Ent { uint64_t slot; uint n; uint tk[4]; uint pad; };
+
+void main() {
+    const uint t = gl_SubgroupInvocationID, m = gl_WorkGroupID.y, e = gl_WorkGroupID.z;
+    Ent en = Ent(pc.ents + uint64_t(e) * 32ul);
+    const uint64_t sa = en.slot;
+    if (sa == 0ul) return;
+    const uint n = min(en.n, uint(NB));
+    uint tk[NB];
+    [[unroll]] for (uint c = 0u; c < NB; ++c) tk[c] = en.tk[c < n ? c : 0u];
+    const uint r0 = (t & 3u) * 2u;
+    const Geom g = tile_geom(t);
+    const uint nt0 = gl_WorkGroupID.x * 2u;
+    uint64_t tile = sa + uint64_t(m == 0u ? pc.tr_off0 : pc.tr_off1) + uint64_t(nt0) * TW * 4u;
+    const uint64_t tstride = uint64_t(pc.nt) * TW * 4u;
+    uint64_t px[NB];
+#ifndef XLEGACY
+    // S19: per-pair x base is uniform (SGPRs), the lane offset r0*4 fixed; tiles via the _s helpers (bit-identical)
+    const uint xo = r0 * 4u;
+    const GeomS q = tile_geom_s(t);
+#endif
+    float a00[NB], a01[NB], a10[NB], a11[NB], sx[NB];
+    [[unroll]] for (uint c = 0u; c < NB; ++c) {
+#ifdef XLEGACY
+        px[c] = pc.xin + uint64_t(tk[c] >> 8) * uint64_t(pc.tstride) + uint64_t((tk[c] & 0xFFu) * pc.xs_e + m * pc.xs_m + r0) * 4ul;
+#else
+        px[c] = pc.xin + uint64_t(tk[c] >> 8) * uint64_t(pc.tstride) + uint64_t(((tk[c] & 0xFFu) * pc.xs_e + m * pc.xs_m) * 4u);
+#endif
+        a00[c] = 0.0; a01[c] = 0.0; a10[c] = 0.0; a11[c] = 0.0; sx[c] = 0.0;
+    }
+    // trellis words: software pipeline distance 2 (as exl3_xmv PIPE2); kt is even (160 / 40)
+#ifdef XLEGACY
+#define TLOAD(p) tile_load(p, g)
+#define TDEC(w, d) tile_dec_w(w, g, d)
+#define XL(c, off) V2(px[c] + uint64_t(off)).v[0]
+#else
+#define TLOAD(p) tile_load_s(p, q)
+#define TDEC(w, d) tile_dec_s(w, q, d)
+#define XL(c, off) V2(px[c] + uint64_t(xo + (off))).v[0]
+#endif
+    TWords A0 = TLOAD(tile), A1 = TLOAD(tile + TW * 4u);
+    TWords B0 = TLOAD(tile + tstride), B1 = TLOAD(tile + tstride + TW * 4u);
+    for (uint k = 0u; k < pc.kt; k += 2u) {
+        const uint kn = k + 2u < pc.kt ? 2u : 0u;
+        const uint64_t tn = tile + tstride * kn;
+        const TWords C0 = TLOAD(tn), C1 = TLOAD(tn + TW * 4u);
+        const TWords D0 = TLOAD(tn + tstride), D1 = TLOAD(tn + tstride + TW * 4u);
+        float d0[8], d1[8], d2[8], d3[8];
+        TDEC(A0, d0);
+        TDEC(A1, d1);
+        TDEC(B0, d2);
+        TDEC(B1, d3);
+        [[unroll]] for (uint c = 0u; c < NB; ++c) {
+            if (c < n) {
+                const vec2 xa0 = XL(c, 0u), xb0 = XL(c, 32u), xa1 = XL(c, 64u), xb1 = XL(c, 96u);
+                sx[c] += (xa0.x + xa0.y) + (xb0.x + xb0.y);
+                a00[c] += d0[0] * xa0.x + d0[1] * xa0.y + d0[2] * xb0.x + d0[3] * xb0.y;
+                a01[c] += d0[4] * xa0.x + d0[5] * xa0.y + d0[6] * xb0.x + d0[7] * xb0.y;
+                a10[c] += d1[0] * xa0.x + d1[1] * xa0.y + d1[2] * xb0.x + d1[3] * xb0.y;
+                a11[c] += d1[4] * xa0.x + d1[5] * xa0.y + d1[6] * xb0.x + d1[7] * xb0.y;
+                sx[c] += (xa1.x + xa1.y) + (xb1.x + xb1.y);
+                a00[c] += d2[0] * xa1.x + d2[1] * xa1.y + d2[2] * xb1.x + d2[3] * xb1.y;
+                a01[c] += d2[4] * xa1.x + d2[5] * xa1.y + d2[6] * xb1.x + d2[7] * xb1.y;
+                a10[c] += d3[0] * xa1.x + d3[1] * xa1.y + d3[2] * xb1.x + d3[3] * xb1.y;
+                a11[c] += d3[4] * xa1.x + d3[5] * xa1.y + d3[6] * xb1.x + d3[7] * xb1.y;
+                px[c] += 128ul;
+            }
+        }
+        A0 = C0; A1 = C1; B0 = D0; B1 = D1;
+        tile = tn;
+    }
+    [[unroll]] for (uint c = 0u; c < NB; ++c) {
+        if (c < n) {
+            const float bias = K_BIAS * subgroupAdd(sx[c]) * 0.125;
+            float b00 = a00[c], b01 = a01[c], b10 = a10[c], b11 = a11[c];
+            b00 += subgroupShuffleXor(b00, 1u); b01 += subgroupShuffleXor(b01, 1u);
+            b10 += subgroupShuffleXor(b10, 1u); b11 += subgroupShuffleXor(b11, 1u);
+            b00 += subgroupShuffleXor(b00, 2u); b01 += subgroupShuffleXor(b01, 2u);
+            b10 += subgroupShuffleXor(b10, 2u); b11 += subgroupShuffleXor(b11, 2u);
+            if ((t & 3u) == 0u) {
+                const uint col = t >> 2, ob = (tk[c] & 0xFFu) * pc.os_e + m * pc.os_m + nt0 * 16u + col;
+                F32 o = F32(pc.out_addr + uint64_t(tk[c] >> 8) * uint64_t(pc.tstride));
+                o.v[ob] = K_INV * b00 + bias;
+                o.v[ob + 8u] = K_INV * b01 + bias;
+                o.v[ob + 16u] = K_INV * b10 + bias;
+                o.v[ob + 24u] = K_INV * b11 + bias;
+            }
+        }
+    }
+}

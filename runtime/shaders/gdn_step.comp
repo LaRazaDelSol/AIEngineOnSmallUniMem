@@ -1,0 +1,68 @@
+#version 460
+// One decode step of Qwen4ExpTextGatedDeltaNet (torch_recurrent_gated_delta_rule, use_qk_l2norm) + the
+// gated RMSNorm, one value head per workgroup (48 heads). 512 threads = 128 value dims j x 4 k-quarters:
+// the two passes over the 128x128 state are split 4 ways and reduced in shared memory (S13 profile:
+// the 128-thread version left the GPU mostly idle, 74 us/layer).
+//   conv (10240): q [16 k-heads x 128] | k [16 x 128] | v [48 x 128]  (after conv1d + SiLU)
+//   proj: z at [10240 .. 16383], b at [16384 .. 16431], a at [16432 .. 16479]  (fused in_proj matvec output)
+//   S[h][k][j] fp32 state.  v-head h uses k-head h / 3 (repeat_interleave).
+#include "common.glsl"
+layout(local_size_x = 512) in;
+layout(push_constant) uniform PC {
+    uint64_t conv; uint64_t proj; uint64_t state; uint64_t alog; uint64_t dtb; uint64_t normw; uint64_t outp; uint64_t state_out; float eps;
+} pc;
+shared float qs[128];
+shared float ks[128];
+shared float part[4][128];
+shared float red[8];
+void main() {
+    const uint h = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x, j = tid & 127u, kq = tid >> 7, kh = h / 3u;
+    F32 C = F32(pc.conv), P = F32(pc.proj), S = F32(pc.state), O = F32(pc.outp), SO = F32(pc.state_out);  // S16: state_out may != state
+    // l2norm of q and k (threads 0..127 own one element each)
+    float q = 0.0, k = 0.0;
+    if (kq == 0u) { q = C.v[kh * 128u + j]; k = C.v[2048u + kh * 128u + j]; }
+    float sq = subgroupAdd(q * q), sk = subgroupAdd(k * k);
+    if (gl_SubgroupInvocationID == 0u && gl_SubgroupID < 2u) { red[gl_SubgroupID] = sq; red[4u + gl_SubgroupID] = sk; }
+    barrier();
+    if (kq == 0u) {
+        qs[j] = q * inversesqrt(red[0] + red[1] + 1e-6) * inversesqrt(128.0);
+        ks[j] = k * inversesqrt(red[4] + red[5] + 1e-6);
+    }
+    barrier();
+    const float b = P.v[16384u + h], a = P.v[16432u + h];
+    const float x = a + F32(pc.dtb).v[h];
+    const float sp = x > 20.0 ? x : log(1.0 + exp(x));
+    const float decay = exp(-exp(F32(pc.alog).v[h]) * sp);
+    const float beta = 1.0 / (1.0 + exp(-b));
+    const uint sb = h * 128u * 128u, k0 = kq * 32u;
+    // S17: the thread's 32 state values are read ONCE and kept in registers for the update pass (was: read twice)
+    float sr[32];
+    [[unroll]] for (uint i = 0u; i < 32u; ++i) sr[i] = S.v[sb + (k0 + i) * 128u + j];
+    float kv = 0.0;
+    [[unroll]] for (uint i = 0u; i < 32u; ++i) kv += sr[i] * ks[k0 + i];
+    part[kq][j] = kv * decay;
+    barrier();
+    const float v = C.v[4096u + h * 128u + j];
+    const float delta = (v - (part[0][j] + part[1][j] + part[2][j] + part[3][j])) * beta;
+    barrier();
+    float o = 0.0;
+    [[unroll]] for (uint i = 0u; i < 32u; ++i) {
+        const uint kk = k0 + i;
+        const float s = sr[i] * decay + ks[kk] * delta;
+        SO.v[sb + kk * 128u + j] = s;
+        o += s * qs[kk];
+    }
+    part[kq][j] = o;
+    barrier();
+    o = part[0][j] + part[1][j] + part[2][j] + part[3][j];
+    // Qwen4ExpTextRMSNormGated over the 128 value dims: o * rsqrt(mean(o^2) + eps) * w[j] * sigmoid(z)
+    float so = kq == 0u ? o * o : 0.0;
+    so = subgroupAdd(so);
+    if (gl_SubgroupInvocationID == 0u && gl_SubgroupID < 2u) red[gl_SubgroupID] = so;
+    barrier();
+    if (kq == 0u) {
+        const float r = inversesqrt((red[0] + red[1]) / 128.0 + pc.eps);
+        const float z = P.v[10240u + h * 128u + j];
+        O.v[h * 128u + j] = o * r * F32(pc.normw).v[j] / (1.0 + exp(-z));
+    }
+}

@@ -1,0 +1,26 @@
+#version 460
+// S18 stage C: router2.comp for NB token columns (router + depth-1 predictor rows, bf16 weights read once per row).
+// Per column the arithmetic is router2.comp's (bit-identical). Column c: x + c*xs, logits/logits2 + c*ls (bytes).
+#include "common.glsl"
+#ifndef NB
+#define NB 2
+#endif
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint64_t w; uint64_t w2; uint64_t x; uint64_t logits; uint64_t logits2; uint n_exp; uint xs; uint ls; uint pad; } pc;
+void main() {
+    const uint g = gl_WorkGroupID.x, lane = gl_SubgroupInvocationID;
+    const bool second = g >= pc.n_exp;
+    const uint r = second ? g - pc.n_exp : g;
+    U32 W = U32((second ? pc.w2 : pc.w) + uint64_t(r) * uint64_t(HIDDEN * 2u));
+    float acc[NB];
+    [[unroll]] for (uint c = 0u; c < NB; ++c) acc[c] = 0.0;
+    for (uint i = lane; i < HIDDEN / 4u; i += 64u) {
+        const uint a = W.v[2u * i], b = W.v[2u * i + 1u];
+        const vec4 w = vec4(uintBitsToFloat(a << 16), uintBitsToFloat(a & 0xFFFF0000u), uintBitsToFloat(b << 16), uintBitsToFloat(b & 0xFFFF0000u));
+        [[unroll]] for (uint c = 0u; c < NB; ++c) acc[c] += dot(w, V4(pc.x + uint64_t(c) * uint64_t(pc.xs)).v[i]);
+    }
+    [[unroll]] for (uint c = 0u; c < NB; ++c) {
+        const float a = subgroupAdd(acc[c]);
+        if (lane == 0u) F32((second ? pc.logits2 : pc.logits) + uint64_t(c) * uint64_t(pc.ls)).v[r] = a;
+    }
+}

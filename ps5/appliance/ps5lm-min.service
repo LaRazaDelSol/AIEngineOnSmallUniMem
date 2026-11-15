@@ -1,0 +1,18 @@
+# /etc/systemd/system/ps5lm-min.service — AI mode, step 1: free memory for the engine at boot.
+# Inert unless the kernel command line has ps5lm.ai=1 (`ps5lm-min boot ai`); game mode boots exactly as before.
+# No ExecStop on purpose: stopping during shutdown would restart the gaming session. Leave AI mode with
+# `sudo ps5lm-min off` (this boot) and `sudo ps5lm-min boot game` (next boot).
+[Unit]
+Description=PS5LM AI mode: strip the console to the engine (ps5lm-min on)
+ConditionKernelCommandLine=ps5lm.ai=1
+# Not After=multi-user.target: the unit is WantedBy it, and that ordering made a cycle (multi-user -> server -> min ->
+# multi-user) that systemd broke by deleting the server job (S15b, first AI-mode boot).
+After=NetworkManager.service sshd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ps5lm-min on
+
+[Install]
+WantedBy=multi-user.target

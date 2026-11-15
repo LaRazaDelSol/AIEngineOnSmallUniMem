@@ -1,0 +1,56 @@
+#version 460
+// Dense causal attention for one decode step (exactly the QSA result while ctx <= budget + ratio - 1 = 2051;
+// the indexer only prunes beyond that). WG per query head (24); GQA: kv head = h / 12.
+//   out[h] = (softmax(q.K^T / 16) V) * sigmoid(gate[h])
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t q; uint64_t g; uint64_t kcache; uint64_t vcache; uint64_t outp; uint64_t scores; uint64_t params; } pc;
+shared float qv[256];
+shared float red[4];
+shared float bc;
+float block_max(float v) {
+    v = subgroupMax(v);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = v;
+    barrier();
+    float t = -1e30;
+    for (uint i = 0u; i < gl_NumSubgroups; ++i) t = max(t, red[i]);
+    barrier();
+    return t;
+}
+float block_sum(float v) {
+    v = subgroupAdd(v);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = v;
+    barrier();
+    float t = 0.0;
+    for (uint i = 0u; i < gl_NumSubgroups; ++i) t += red[i];
+    barrier();
+    return t;
+}
+void main() {
+    const uint h = gl_WorkGroupID.x, i = gl_LocalInvocationID.x, kvh = h / 12u;
+    const uint n = U32(pc.params).v[0] + 1u;  // positions 0..pos
+    F32 K = F32(pc.kcache), V = F32(pc.vcache), Sc = F32(pc.scores);
+    qv[i] = F32(pc.q).v[h * 256u + i];
+    barrier();
+    const uint sb = h * 4096u;  // scores scratch: 24 x max_ctx (4096)
+    float m = -1e30;
+    for (uint t = i; t < n; t += 256u) {
+        float d = 0.0;
+        const uint kb = (t * 2u + kvh) * 256u;
+        for (uint e = 0u; e < 256u; ++e) d += qv[e] * K.v[kb + e];
+        d *= 0.0625;
+        Sc.v[sb + t] = d;
+        m = max(m, d);
+    }
+    m = block_max(m);
+    float s = 0.0;
+    for (uint t = i; t < n; t += 256u) { const float p = exp(Sc.v[sb + t] - m); Sc.v[sb + t] = p; s += p; }
+    s = block_sum(s);
+    memoryBarrierBuffer();
+    barrier();
+    float o = 0.0;
+    for (uint t = 0u; t < n; ++t) o += Sc.v[sb + t] * V.v[(t * 2u + kvh) * 256u + i];
+    o /= s;
+    const float g = F32(pc.g).v[h * 256u + i];
+    F32(pc.outp).v[h * 256u + i] = o / (1.0 + exp(-g));
+}

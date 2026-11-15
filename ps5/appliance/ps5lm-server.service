@@ -1,0 +1,34 @@
+# /etc/systemd/system/ps5lm-server.service — AI mode, step 2: the inference server (OpenAI + Anthropic API, :8081).
+# Inert unless ps5lm.ai=1. Settings: /etc/ps5lm/server.env (PS5LM_BITS=2|4, PS5LM_ARGS="...").
+# Restart policy is deliberately slow: an engine that died holding a pinned/hugetlb slab must release it before the
+# next one sizes its pool (S14: pinning past the edge hung the console), so 30 s between tries and at most 3 per 15 min.
+[Unit]
+Description=PS5LM inference server (flash_decode --serve behind ps5lm_server.py)
+ConditionKernelCommandLine=ps5lm.ai=1
+Requires=ps5lm-min.service
+After=ps5lm-min.service network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=900
+StartLimitBurst=3
+
+[Service]
+Type=simple
+Environment=PS5LM_BITS=2 PS5LM_ARGS=
+EnvironmentFile=-/etc/ps5lm/server.env
+# S23: preflight before every start (also after a crash restart): releases hugepages a killed engine left reserved, so the
+# new engine sizes its pool from real free memory; warns about tmpfs junk and boot parameters. Never blocks the start.
+ExecStartPre=-/bin/bash /home/steam/ps5lm/src/scripts/console/preflight.sh --fix
+ExecStart=/bin/sh -c 'exec /usr/bin/python3 /home/steam/ps5lm/src/runtime/tools/ps5lm_server.py --model /home/steam/ps5lm/model --bin /home/steam/ps5lm/build14/flash_decode --shaders /home/steam/ps5lm/build14/shaders --bits "$PS5LM_BITS" --port 8081 --residency /home/steam/ps5lm/model/residency_q"$PS5LM_BITS".txt $PS5LM_ARGS'
+# SIGTERM -> the front end sends Q, the engine saves the residency and releases its hugetlb slab.
+# mixed: SIGTERM to the front end ONLY (control-group would signal the engine at the same instant, before it can save;
+# S15 measured that: no residency written and 10.9 GiB of hugepages left reserved). Stragglers get SIGKILL at timeout.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=30
+# the engine sets its own oom_score_adj=1000; the front end goes first too, never sshd/NetworkManager
+OOMScoreAdjust=1000
+
+[Install]
+WantedBy=multi-user.target

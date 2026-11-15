@@ -1,0 +1,18 @@
+#version 460
+// out = x * rsqrt(mean(x^2) + eps) * gamma ; one workgroup of 256 threads.
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t x; uint64_t gamma; uint64_t outp; uint n; float eps; } pc;
+shared float part[8];
+void main() {
+    F32 X = F32(pc.x), G = F32(pc.gamma), O = F32(pc.outp);
+    float s = 0.0;
+    for (uint i = gl_LocalInvocationID.x; i < pc.n; i += 256u) { float t = X.v[i]; s += t * t; }
+    s = subgroupAdd(s);
+    if (gl_SubgroupInvocationID == 0u) part[gl_SubgroupID] = s;
+    barrier();
+    float tot = 0.0;
+    for (uint i = 0u; i < gl_NumSubgroups; ++i) tot += part[i];
+    float inv = inversesqrt(tot / float(pc.n) + pc.eps);
+    for (uint i = gl_LocalInvocationID.x; i < pc.n; i += 256u) O.v[i] = X.v[i] * inv * G.v[i];
+}

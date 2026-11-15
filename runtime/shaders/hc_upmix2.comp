@@ -1,0 +1,51 @@
+#version 460
+// S17 hyper-connection pre-step (hc_mode 3), part 3 (replaces hc_upmix):
+//   sig[c*H+i] = sigmoid(up[c*H+i] . t)        (rank-320: 40 quant words per row)
+//   x[i]       = mean_c sig[c*H+i] * N[c*H+i],  N computed on the fly: H * (1/rms_c) * (1 + w)
+//   inj[c]     = 2 * sigmoid(injl[c] / C)      (only if pc.injl != 0)
+// One wave64 per output i, lanes 16c..16c+15 own stream row c (words sub, sub+16, sub+32): all 64 lanes busy (the
+// S15 kernel left lanes 40..63 idle and ran the 4 rows one after the other).
+#define BITS 4
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t w; uint64_t t; uint64_t x; uint64_t nw; uint64_t psum; uint64_t xout; uint64_t injl; uint64_t inj;
+    float eps; uint pad;
+} pc;
+const uint H = 2560u, C = 4u, KU = 320u;
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint i = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    const uint c = lane >> 4, sub = lane & 15u;
+    const uint SW = scale_words(KU), RW = row_words(KU), QW = quant_words(KU);  // QW = 40
+    U32 W = U32(pc.w);
+    V4 T = V4(pc.t);
+    const uint rb = (c * H + i) * RW;
+    float acc = 0.0;
+    [[unroll]] for (uint j = 0u; j < 3u; ++j) {
+        const uint w = sub + 16u * j;
+        if (w < QW) {
+            float xv[16];
+            float sx;
+            load_x(T, w, xv, sx);
+            acc += block_scale(W, rb, w) * word_dot(W.v[rb + SW + w], xv, sx);
+        }
+    }
+    acc = subgroupClusteredAdd(acc, 16u);
+    float term = 0.0;
+    if (sub == 0u) {
+        F32 P = F32(pc.psum);
+        float ss = 0.0;
+        for (uint k = 0u; k < 10u; ++k) ss += P.v[c * 10u + k];
+        const float inv = inversesqrt(ss / float(H) + pc.eps);
+        const float sig = 1.0 / (1.0 + exp(-acc));
+        const uint e = c * H + i;
+        term = sig * (F32(pc.x).v[e] * inv * (1.0 + F32(pc.nw).v[e]));
+    }
+    const float t0 = subgroupShuffle(term, 0u), t1 = subgroupShuffle(term, 16u), t2 = subgroupShuffle(term, 32u), t3 = subgroupShuffle(term, 48u);
+    if (lane == 0u && i < H) F32(pc.xout).v[i] = (((t0 + t1) + t2) + t3) / float(C);
+    if (pc.injl != 0ul && gl_WorkGroupID.x == 0u && gl_LocalInvocationID.x < C)
+        F32(pc.inj).v[gl_LocalInvocationID.x] = 2.0 / (1.0 + exp(-F32(pc.injl).v[gl_LocalInvocationID.x] / float(C)));
+}

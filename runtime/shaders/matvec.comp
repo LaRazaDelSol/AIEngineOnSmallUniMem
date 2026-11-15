@@ -1,0 +1,34 @@
+#version 460
+// Generic dense PS5Q4 matvec: y[r] (+)= act(alpha * W[r] . x), r < N, W rows of K (K % 32 == 0).
+// mode: 0 store, 1 accumulate, 2 silu, 3 sigmoid. One wave64 per row block; x read via the L0/L1 cache.
+#define BITS 4
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint64_t w; uint64_t x; uint64_t y; uint K; uint N; uint rpw; uint mode; float alpha; } pc;
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint SW = scale_words(pc.K), RW = row_words(pc.K), QW = quant_words(pc.K);
+    U32 W = U32(pc.w);
+    V4 X = V4(pc.x);
+    F32 Y = F32(pc.y);
+    const uint r0 = gl_WorkGroupID.x * pc.rpw;
+    for (uint rr = 0u; rr < pc.rpw; ++rr) {
+        const uint r = r0 + rr;
+        if (r >= pc.N) break;
+        const uint rb = r * RW;
+        float acc = 0.0;
+        for (uint w = lane; w < QW; w += 64u) {
+            float xv[16];
+            float sx;
+            load_x(X, w, xv, sx);
+            acc += block_scale(W, rb, w) * word_dot(W.v[rb + SW + w], xv, sx);
+        }
+        acc = subgroupAdd(acc) * pc.alpha;
+        if (lane == 0u) {
+            float o = acc;
+            if (pc.mode == 2u) o = acc / (1.0 + exp(-acc));
+            else if (pc.mode == 3u) o = 1.0 / (1.0 + exp(-acc));
+            if (pc.mode == 1u) Y.v[r] += o; else Y.v[r] = o;
+        }
+    }
+}

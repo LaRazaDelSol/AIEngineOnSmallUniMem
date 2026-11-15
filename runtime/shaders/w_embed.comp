@@ -1,0 +1,11 @@
+#version 460
+// S21 wide prefill: token embeddings (bf16 rows staged by the host, [T][2560]) into the 4 residual streams of the carry:
+// H[t][c*2560 + i] = float(emb[t][i]) (bf16 << 16, the host conversion of the S20 path: bit-identical). Grid (10240/256, T).
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t emb; uint64_t h; uint hs; uint pad; } pc;
+void main() {
+    const uint j = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y, i = j % HIDDEN;
+    const uint w = U32(pc.emb + uint64_t(t) * uint64_t(HIDDEN * 2u)).v[i >> 1];
+    F32(pc.h + uint64_t(t) * uint64_t(pc.hs)).v[j] = uintBitsToFloat((i & 1u) != 0u ? (w & 0xFFFF0000u) : (w << 16));
+}

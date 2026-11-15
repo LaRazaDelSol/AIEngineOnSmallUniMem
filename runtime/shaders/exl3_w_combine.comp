@@ -1,0 +1,28 @@
+#version 460
+// S21 wide prefill: exl3_combine.comp for T tokens: out[t][n] = sum_k w[t][k] * H128(yd[t*10+k])[n] * svh_down (k in order,
+// as exl3_combine). slots / wt are [T][10]; yd pairs [T*10][2560]; out + t*os. Grid (20, T).
+#include "exl3_common.glsl"
+layout(local_size_x = 128) in;
+layout(push_constant) uniform PC { uint64_t yd; uint64_t slots; uint64_t wt; uint64_t out_addr; uint nexp; uint os; } pc;
+shared float sh[128];
+void main() {
+    const uint i = gl_LocalInvocationID.x, n = gl_WorkGroupID.x * 128u + i, t = gl_WorkGroupID.y;
+    float acc = 0.0;
+    for (uint e = 0u; e < pc.nexp; ++e) {
+        const uint p = t * pc.nexp + e;
+        const uint64_t sa = U64(pc.slots).v[p];
+        float v = F32(pc.yd).v[p * 2560u + n];
+        sh[i] = v;
+        barrier();
+        [[unroll]] for (uint h = 1u; h < 128u; h <<= 1) {
+            const float o = sh[i ^ h];
+            barrier();
+            v = (i & h) == 0u ? v + o : o - v;
+            sh[i] = v;
+            barrier();
+        }
+        if (sa != 0ul) acc += F32(pc.wt).v[p] * v * RSQRT128 * float(H16(sa + OFF_D_SVH).v[n]);
+        barrier();
+    }
+    F32(pc.out_addr + uint64_t(t) * uint64_t(pc.os)).v[n] = acc;
+}

@@ -1,0 +1,121 @@
+cmake_minimum_required(VERSION 3.21)
+project(ps5lm_runtime LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+option(PS5LM_HIP "Build HIP kernels + GPU tests (gfx1030 target)" OFF)
+set(PS5LM_GPU_ARCH "gfx1030" CACHE STRING "HIP offload arch (theoretical PS5 spec: gfx1030)")
+option(PS5LM_SOFT_DOT4 "Emulate v_dot4_i32_i8 (ISAs without dot1-insts, e.g. gfx1013)" OFF)
+option(PS5LM_BUILD_BENCH "Build the kernel benches and validation tools (not needed to serve)" ON)
+option(PS5LM_NATIVE "Tune for the PS5 CPU (-march=znver2); OFF for portable host/CI builds" ON)
+
+if(MSVC)
+  add_compile_options(/W4 /permissive- /utf-8)
+else()
+  add_compile_options(-Wall -Wextra -Wpedantic)
+  # Zen 2 host (PS5 CPU): AVX2/FMA, no AVX-512.
+  if(PS5LM_NATIVE AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    add_compile_options(-march=znver2 -mtune=znver2)
+  endif()
+endif()
+
+add_library(ps5lm_core INTERFACE)
+target_include_directories(ps5lm_core INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+enable_testing()
+
+# ---- portable: builds and tests on any OS (gate S1 runs here) ----
+add_executable(trace_replay src/trace_replay.cpp)
+target_link_libraries(trace_replay PRIVATE ps5lm_core)
+
+add_executable(test_slot_cache tests/test_slot_cache.cpp)
+target_link_libraries(test_slot_cache PRIVATE ps5lm_core)
+add_test(NAME slot_cache COMMAND test_slot_cache)
+
+add_executable(test_quant tests/test_quant.cpp)
+target_link_libraries(test_quant PRIVATE ps5lm_core)
+add_test(NAME quant COMMAND test_quant)
+
+# ---- Linux: io_uring streamer ----
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(URING REQUIRED IMPORTED_TARGET liburing>=2.4)
+  find_package(Threads REQUIRED)
+
+  add_executable(pack_convert src/pack_convert.cpp)
+  target_link_libraries(pack_convert PRIVATE ps5lm_core Threads::Threads)
+
+  add_executable(stream_bench src/stream_bench.cpp)
+  target_link_libraries(stream_bench PRIVATE ps5lm_core PkgConfig::URING Threads::Threads)
+
+  # ---- Vulkan compute backend (S13: the PS5 path; GFX1013 has no ROCm and no DP4A) ----
+  find_package(Vulkan)
+  find_program(GLSLC glslc)
+  if(Vulkan_FOUND AND GLSLC)
+    set(SPV_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
+    file(MAKE_DIRECTORY ${SPV_DIR})
+    set(SPVS)
+    set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+    function(ps5lm_shader name src defs)
+      set(out ${SPV_DIR}/${name}.spv)
+      add_custom_command(OUTPUT ${out}
+        COMMAND ${GLSLC} -O --target-env=vulkan1.3 -I ${SHADER_SRC} ${defs} ${SHADER_SRC}/${src} -o ${out}
+        DEPENDS ${SHADER_SRC}/${src} ${SHADER_SRC}/common.glsl ${SHADER_SRC}/exl3_common.glsl VERBATIM)
+      set(SPVS ${SPVS} ${out} PARENT_SCOPE)
+    endfunction()
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Shaders.cmake)
+    add_custom_target(ps5lm_shaders ALL DEPENDS ${SPVS})
+
+    if(PS5LM_BUILD_BENCH)
+      add_executable(vk_kernel_test src/vk_kernel_test.cpp)
+      target_link_libraries(vk_kernel_test PRIVATE ps5lm_core Vulkan::Vulkan Threads::Threads)
+      add_dependencies(vk_kernel_test ps5lm_shaders)
+
+      add_executable(moe_decode src/moe_decode.cpp)
+      target_link_libraries(moe_decode PRIVATE ps5lm_core Vulkan::Vulkan PkgConfig::URING Threads::Threads)
+      add_dependencies(moe_decode ps5lm_shaders)
+
+      add_executable(clk_bench src/clk_bench.cpp)
+      target_link_libraries(clk_bench PRIVATE ps5lm_core Vulkan::Vulkan Threads::Threads)
+      add_dependencies(clk_bench ps5lm_shaders)
+      add_executable(xmvl_bench src/xmvl_bench.cpp)
+      target_link_libraries(xmvl_bench PRIVATE ps5lm_core Vulkan::Vulkan Threads::Threads)
+      add_dependencies(xmvl_bench ps5lm_shaders)
+      add_executable(exl3_moe_test src/exl3_moe_test.cpp)
+      target_link_libraries(exl3_moe_test PRIVATE ps5lm_core Vulkan::Vulkan Threads::Threads)
+      add_dependencies(exl3_moe_test ps5lm_shaders)
+      add_executable(exl3_bench src/exl3_bench.cpp)
+      target_link_libraries(exl3_bench PRIVATE ps5lm_core Vulkan::Vulkan Threads::Threads)
+      add_executable(gemm_bench src/gemm_bench.cpp)
+      target_link_libraries(gemm_bench PRIVATE ps5lm_core Vulkan::Vulkan Threads::Threads)
+      add_executable(mv_bench src/mv_bench.cpp)
+      target_link_libraries(mv_bench PRIVATE ps5lm_core Vulkan::Vulkan Threads::Threads)
+      add_dependencies(exl3_bench ps5lm_shaders)
+    endif()
+    add_executable(flash_decode src/flash_decode.cpp)
+    target_link_libraries(flash_decode PRIVATE ps5lm_core Vulkan::Vulkan PkgConfig::URING Threads::Threads)
+    add_dependencies(flash_decode ps5lm_shaders)
+  endif()
+
+  if(PS5LM_HIP)
+    enable_language(HIP)
+    set(CMAKE_HIP_STANDARD 20)
+    set(CMAKE_HIP_ARCHITECTURES ${PS5LM_GPU_ARCH})
+    find_package(hip REQUIRED)
+    add_library(ps5lm_kernels STATIC kernels/moe_kernels.hip)
+    target_link_libraries(ps5lm_kernels PUBLIC ps5lm_core hip::host)
+    target_compile_options(ps5lm_kernels PRIVATE -O3 -ffast-math)
+    if(PS5LM_SOFT_DOT4)
+      target_compile_definitions(ps5lm_kernels PRIVATE PS5LM_SOFT_DOT4=1)
+    endif()
+
+    add_executable(test_kernels_hip tests/test_kernels_hip.cpp)
+    set_source_files_properties(tests/test_kernels_hip.cpp PROPERTIES LANGUAGE HIP)
+    target_link_libraries(test_kernels_hip PRIVATE ps5lm_kernels PkgConfig::URING hip::host)
+    add_test(NAME kernels_hip COMMAND test_kernels_hip)
+  endif()
+endif()

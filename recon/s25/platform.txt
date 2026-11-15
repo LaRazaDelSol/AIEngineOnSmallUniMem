@@ -1,0 +1,4 @@
+pcspkr
+ps5-cec
+ps5-fan
+ps5-led

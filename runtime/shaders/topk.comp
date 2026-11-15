@@ -1,0 +1,54 @@
+#version 460
+// Softmax-top-k with renormalised weights (Qwen norm_topk_prob): one wave64, E <= 512.
+// Writes the mailbox: ids[16] (uint), w[16] (f32), then seq (uint) last.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_ballot : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer Mail { uint ids[16]; float w[16]; uint seq; };
+#ifdef TWO
+// S17 topk2: workgroup 1 does the predictor's mailbox (logits2 -> mail2, seq2) in the same dispatch
+layout(push_constant) uniform PC { uint64_t logits_a; uint64_t mail_a; uint n_exp; uint k; uint seq_a; uint pad; uint64_t logits2; uint64_t mail2; uint seq2; } pc;
+#else
+layout(push_constant) uniform PC { uint64_t logits; uint64_t mail; uint n_exp; uint k; uint seq; } pc;
+#endif
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+#ifdef TWO
+    const bool second = gl_WorkGroupID.x == 1u;
+    const uint64_t pc_logits = second ? pc.logits2 : pc.logits_a, pc_mail = second ? pc.mail2 : pc.mail_a;
+    const uint pc_seq = second ? pc.seq2 : pc.seq_a;
+#else
+    const uint64_t pc_logits = pc.logits, pc_mail = pc.mail;
+    const uint pc_seq = pc.seq;
+#endif
+    float v[8];
+    F32 L = F32(pc_logits);
+    float m = -1e30;
+    [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+        uint ix = lane + 64u * i;
+        v[i] = ix < pc.n_exp ? L.v[ix] : -1e30;
+        m = max(m, v[i]);
+    }
+    m = subgroupMax(m);
+    float wsum = 0.0;
+    float wk[16];
+    uint idk[16];
+    for (uint k = 0u; k < pc.k; ++k) {
+        float best = -1e30;
+        uint bi = 0xFFFFFFFFu;
+        [[unroll]] for (uint i = 0u; i < 8u; ++i) if (v[i] > best) { best = v[i]; bi = lane + 64u * i; }
+        float gb = subgroupMax(best);
+        uint gi = subgroupMin(best == gb ? bi : 0xFFFFFFFFu);
+        [[unroll]] for (uint i = 0u; i < 8u; ++i) if (lane + 64u * i == gi) v[i] = -1e30;
+        float p = exp(gb - m);
+        idk[k] = gi;
+        wk[k] = p;
+        wsum += p;
+    }
+    if (lane == 0u) {
+        Mail M = Mail(pc_mail);
+        for (uint k = 0u; k < pc.k; ++k) { M.ids[k] = idk[k]; M.w[k] = wk[k] / wsum; }
+        memoryBarrierBuffer();
+        M.seq = pc_seq;
+    }
+}

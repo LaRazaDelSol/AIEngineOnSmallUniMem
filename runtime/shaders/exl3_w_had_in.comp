@@ -1,0 +1,33 @@
+#version 460
+// S21 wide prefill: exl3_had_in.comp over (token, k) PAIRS: pair p = t*10 + k (slots[p] = its expert slot, 0 = skip),
+// x of token t at x + t*xs, out xt + p * 2*2560 floats. Grid (20, 2, pairs). Per pair the arithmetic is exl3_had_in's.
+#include "exl3_common.glsl"
+layout(local_size_x = 128) in;
+// -DGTOK (S22 expert-major groups): pair p's token is U32(tok).v[p] (the group's pair -> chunk token table) instead of p / 10.
+#ifdef GTOK
+layout(push_constant) uniform PC { uint64_t x; uint64_t slots; uint64_t xt; uint64_t tok; uint xs; uint pad; } pc;
+#else
+layout(push_constant) uniform PC { uint64_t x; uint64_t slots; uint64_t xt; uint xs; uint pad; } pc;
+#endif
+shared float sh[128];
+void main() {
+    const uint i = gl_LocalInvocationID.x, b = gl_WorkGroupID.x, m = gl_WorkGroupID.y, p = gl_WorkGroupID.z;
+    const uint64_t sa = U64(pc.slots).v[p];
+    if (sa == 0ul) return;
+#ifdef GTOK
+    const uint n = b * 128u + i, t = U32(pc.tok).v[p];
+#else
+    const uint n = b * 128u + i, t = p / 10u;
+#endif
+    float v = F32(pc.x + uint64_t(t) * uint64_t(pc.xs)).v[n] * float(H16(sa + (m == 0u ? OFF_G_SUH : OFF_U_SUH)).v[n]);
+    sh[i] = v;
+    barrier();
+    [[unroll]] for (uint h = 1u; h < 128u; h <<= 1) {
+        const float o = sh[i ^ h];
+        barrier();
+        v = (i & h) == 0u ? v + o : o - v;
+        sh[i] = v;
+        barrier();
+    }
+    F32(pc.xt).v[(p * 2u + m) * 2560u + n] = v * RSQRT128;
+}

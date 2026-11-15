@@ -1,0 +1,15 @@
+#version 460
+// S13 f32 router (moe_decode, vk_kernel_test). logits[r] = Wr[r] . x  (Wr f32 [E][HIDDEN], resident). One wave64 per row.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint64_t w; uint64_t x; uint64_t logits; uint n_exp; } pc;
+void main() {
+    const uint r = gl_WorkGroupID.x, lane = gl_SubgroupInvocationID;
+    if (r >= pc.n_exp) return;
+    V4 W = V4(pc.w + uint64_t(r) * uint64_t(HIDDEN * 4u));
+    V4 X = V4(pc.x);
+    float acc = 0.0;
+    for (uint i = lane; i < HIDDEN / 4u; i += 64u) acc += dot(W.v[i], X.v[i]);
+    acc = subgroupAdd(acc);
+    if (lane == 0u) F32(pc.logits).v[r] = acc;
+}

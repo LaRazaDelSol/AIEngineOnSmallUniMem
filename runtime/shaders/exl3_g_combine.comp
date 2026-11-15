@@ -1,0 +1,36 @@
+#version 460
+// S22 expert-major groups: the routed combine of one group, accumulated into the chunk's MoE output rows.
+// Token entry j (88 bytes): token | n | gq[10] (group pair indices, in k order) | w[10] (router weights). For each of its n
+// pairs: v = H128(yd[gq]) * RSQRT128 * svh_down(slot[gq]) (exl3_w_combine's per-pair arithmetic), y[token] += sum_j w v
+// (pairs in k order, then added to the row: the shared expert stored it first, earlier groups added theirs).
+// A token appears at most once per group, so the read-modify-write of its row is race-free; groups run in a fixed order
+// (barrier between them): deterministic. Grid (20, tokens of the group).
+#include "exl3_common.glsl"
+layout(local_size_x = 128) in;
+layout(push_constant) uniform PC { uint64_t yd; uint64_t slots; uint64_t tents; uint64_t out_addr; uint os; uint pad; } pc;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer TEnt { uint tok; uint n; uint gq[10]; float w[10]; };
+shared float sh[128];
+void main() {
+    const uint i = gl_LocalInvocationID.x, col = gl_WorkGroupID.x * 128u + i;
+    TEnt te = TEnt(pc.tents + uint64_t(gl_WorkGroupID.y) * 88ul);
+    const uint n = min(te.n, 10u);
+    float acc = 0.0;
+    for (uint j = 0u; j < n; ++j) {
+        const uint q = te.gq[j];
+        const uint64_t sa = U64(pc.slots).v[q];
+        float v = F32(pc.yd).v[q * 2560u + col];
+        sh[i] = v;
+        barrier();
+        [[unroll]] for (uint h = 1u; h < 128u; h <<= 1) {
+            const float o = sh[i ^ h];
+            barrier();
+            v = (i & h) == 0u ? v + o : o - v;
+            sh[i] = v;
+            barrier();
+        }
+        acc += te.w[j] * v * RSQRT128 * float(H16(sa + OFF_D_SVH).v[col]);
+        barrier();
+    }
+    F32 o = F32(pc.out_addr + uint64_t(te.tok) * uint64_t(pc.os));
+    o.v[col] += acc;
+}

@@ -1,0 +1,17 @@
+#version 460
+// Qwen4ExpTextGatedResidual tail. sig = sigmoid(up(silu(down(normed)/C))) is computed by matvec; here:
+//   x[i]   = mean_c sig[c*H+i] * normed[c*H+i]
+//   inj[c] = 2 * sigmoid(injl[c] / C)            (only if pc.injl != 0)
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t sig; uint64_t normed; uint64_t xout; uint64_t injl; uint64_t inj; uint C; } pc;
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    F32 S = F32(pc.sig), Nn = F32(pc.normed), X = F32(pc.xout);
+    if (i < HIDDEN) {
+        float a = 0.0;
+        for (uint c = 0u; c < pc.C; ++c) a += S.v[c * HIDDEN + i] * Nn.v[c * HIDDEN + i];
+        X.v[i] = a / float(pc.C);
+    }
+    if (pc.injl != 0ul && i < pc.C) F32(pc.inj).v[i] = 2.0 / (1.0 + exp(-F32(pc.injl).v[i] / float(pc.C)));
+}

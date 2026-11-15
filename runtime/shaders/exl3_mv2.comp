@@ -1,0 +1,96 @@
+#version 460
+// S15b: EXL3 "mul1" K=3 trellis matvec for GFX1013, ISA-tuned (successor of exl3_mv.comp variants 0-3, which were
+// bound by address arithmetic + x reloads + a 5-op byte sum, not by the trellis decode itself).
+// Same byte-preserving layout/mapping as exl3_mv.comp (exllamav3 dq8<3,cb,4> windows, tensor-core tile permutation).
+//  * per-lane 64-bit pointers advanced once per k-tile (immediate-offset loads, no per-load 64-bit index math)
+//  * NTW output tiles per wave share each k-tile's x loads and loop overhead
+//  * byte sum: SAD=1 -> dotPacked4x8EXT(p, 0x01010101) + 0x6400 (lowers to v_sad_u8 / v_dot4 where present);
+//    its low 16 bits ARE the fp16 bit pattern of 1024+s, consumed by a mixed-precision FMA without a convert.
+//    SAD=0 -> SWAR byte sum with the 0x6400 folded in.
+//  * MULSPLIT=1: idx * 0x83DCD12D as two 24-bit multiplies + shift-add (full rate) instead of v_mul_lo_u32 (1/4 rate)
+// Result per output = sum((1024 + s) * x); caller applies k_inv and the -(1024+510)*k_inv*sum(x) bias.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#if SAD
+#extension GL_EXT_integer_dot_product : require
+#endif
+layout(local_size_x = 32) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer V2 { vec2 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v[]; };
+layout(push_constant) uniform PC { uint64_t trel; uint64_t x; uint64_t out_addr; uint c_lo; uint c_hi; } pc;
+
+#ifndef NTW
+#define NTW 2
+#endif
+#ifndef BATCH
+#define BATCH 1
+#endif
+const uint KT = 160u, NT = 40u, TW = 24u;
+
+float16_t dec(uint w) {  // w: 16-bit window (already masked)
+#if MULSPLIT == 2
+    // constants from push constants, masked to 24/8 bits: NIR cannot re-fuse them into one 32-bit multiply,
+    // ACO sees both operands < 2^24 and can select v_mul_u32_u24 (full rate)
+    const uint p = w * (pc.c_lo & 0xFFFFFFu) + ((w * (pc.c_hi & 0xFFu)) << 24);
+#elif MULSPLIT
+    const uint p = w * 0xDCD12Du + ((w * 0x83u) << 24);
+#else
+    const uint p = w * 0x83DCD12Du;
+#endif
+#if SAD
+    const uint s = dotPacked4x8AccSatEXT(p, 0x01010101u, 0x6400u);
+#else
+    const uint e = (p & 0x00FF00FFu) + ((p >> 8) & 0x00FF00FFu);
+    const uint s = (e & 0xFFFFu) + (e >> 16) + 0x6400u;
+#endif
+    return unpackFloat2x16(s).x;
+}
+
+void main() {
+    const uint t = gl_SubgroupInvocationID, m = gl_WorkGroupID.y;
+    const uint r0 = (t & 3u) * 2u;
+    const int b1 = int(t * 8u + 257u) * 3, b0 = b1 - 16, b2 = b1 + 21;
+    const uint i0 = uint(b0 >> 5) % TW, i2 = uint((b2 - 1) >> 5) % TW;
+    const uint s2 = uint(((b2 - 1) >> 5) + 1) * 32u - uint(b2);
+    const uint nt0 = gl_WorkGroupID.x * NTW;
+    uint64_t pa = pc.trel + uint64_t((m * KT * NT + nt0) * TW + i0) * 4ul;
+    uint64_t pb = pc.trel + uint64_t((m * KT * NT + nt0) * TW + i2) * 4ul;
+    uint64_t px = pc.x + uint64_t(m * 2560u * BATCH + r0) * 4ul;   // x layout [m][b][2560]
+    float acc[NTW][2][BATCH];
+    [[unroll]] for (uint j = 0u; j < NTW; ++j) [[unroll]] for (uint q = 0u; q < BATCH; ++q) { acc[j][0][q] = 0.0; acc[j][1][q] = 0.0; }
+    for (uint kt = 0u; kt < KT; ++kt) {
+        vec2 xa[BATCH], xb[BATCH];   // rows r0, r0+1 | r0+8, r0+9
+        [[unroll]] for (uint q = 0u; q < BATCH; ++q) { xa[q] = V2(px).v[q * 1280u]; xb[q] = V2(px).v[q * 1280u + 4u]; }
+        [[unroll]] for (uint j = 0u; j < NTW; ++j) {
+            const uint a = U32(pa).v[j * TW], b = U32(pb).v[j * TW];
+            const uint64_t v = (uint64_t(a) << 32) | uint64_t(b);
+            const uint w7 = uint(v >> s2), w3 = uint(v >> (s2 + 12u));
+            const float d0 = float(dec(bitfieldExtract(w3, 9, 16))), d1 = float(dec(bitfieldExtract(w3, 6, 16)));
+            const float d2 = float(dec(bitfieldExtract(w3, 3, 16))), d3 = float(dec(w3 & 0xFFFFu));
+            const float d4 = float(dec(bitfieldExtract(w7, 9, 16))), d5 = float(dec(bitfieldExtract(w7, 6, 16)));
+            const float d6 = float(dec(bitfieldExtract(w7, 3, 16))), d7 = float(dec(w7 & 0xFFFFu));
+            [[unroll]] for (uint q = 0u; q < BATCH; ++q) {
+                acc[j][0][q] += d0 * xa[q].x + d1 * xa[q].y + d2 * xb[q].x + d3 * xb[q].y;
+                acc[j][1][q] += d4 * xa[q].x + d5 * xa[q].y + d6 * xb[q].x + d7 * xb[q].y;
+            }
+        }
+        pa += uint64_t(NT * TW * 4u);
+        pb += uint64_t(NT * TW * 4u);
+        px += 64ul;
+    }
+    [[unroll]] for (uint j = 0u; j < NTW; ++j) [[unroll]] for (uint q = 0u; q < BATCH; ++q) {
+        float a0 = acc[j][0][q], a1 = acc[j][1][q];
+        a0 += subgroupShuffleXor(a0, 1u); a1 += subgroupShuffleXor(a1, 1u);
+        a0 += subgroupShuffleXor(a0, 2u); a1 += subgroupShuffleXor(a1, 2u);
+        if ((t & 3u) == 0u) {
+            const uint c = (nt0 + j) * 16u + (t >> 2);
+            F32(pc.out_addr).v[(q * 20u + m) * 640u + c] = a0;          // out layout [b][m][640]
+            F32(pc.out_addr).v[(q * 20u + m) * 640u + c + 8u] = a1;
+        }
+    }
+}

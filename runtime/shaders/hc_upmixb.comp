@@ -1,0 +1,48 @@
+#version 460
+// S18 stage C: hc_upmix.comp for NB token columns (the up weights are read once; per column hc_upmix's arithmetic).
+// Every per-token pointer (t, normed, xout, injl, inj) advances by st bytes per column.
+#define BITS 4
+#include "common.glsl"
+#ifndef NB
+#define NB 2
+#endif
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t w; uint64_t t; uint64_t normed; uint64_t xout; uint64_t injl; uint64_t inj; uint st; uint pad; } pc;
+const uint H = 2560u, C = 4u, KU = 320u;
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint i = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    const uint SW = scale_words(KU), RW = row_words(KU), QW = quant_words(KU);
+    U32 W = U32(pc.w);
+    float sig[NB][4];
+    [[unroll]] for (uint c = 0u; c < C; ++c) {
+        const uint rb = (c * H + i) * RW;
+        float acc[NB];
+        [[unroll]] for (uint b = 0u; b < NB; ++b) acc[b] = 0.0;
+        for (uint w = lane; w < QW; w += 64u) {
+            const uint q = W.v[rb + SW + w];
+            const float bs = block_scale(W, rb, w);
+            [[unroll]] for (uint b = 0u; b < NB; ++b) {
+                float xv[16];
+                float sx;
+                load_x(V4(pc.t + uint64_t(b) * uint64_t(pc.st)), w, xv, sx);
+                acc[b] += bs * word_dot(q, xv, sx);
+            }
+        }
+        [[unroll]] for (uint b = 0u; b < NB; ++b) {
+            const float a = subgroupAdd(acc[b]) * 1.0;
+            sig[b][c] = 1.0 / (1.0 + exp(-a));
+        }
+    }
+    if (lane == 0u && i < H)
+        [[unroll]] for (uint b = 0u; b < NB; ++b) {
+            F32 Nn = F32(pc.normed + uint64_t(b) * uint64_t(pc.st));
+            float a = 0.0;
+            [[unroll]] for (uint c = 0u; c < C; ++c) a += sig[b][c] * Nn.v[c * H + i];
+            F32(pc.xout + uint64_t(b) * uint64_t(pc.st)).v[i] = a / float(C);
+        }
+    if (pc.injl != 0ul && gl_WorkGroupID.x == 0u && gl_LocalInvocationID.x < C)
+        [[unroll]] for (uint b = 0u; b < NB; ++b)
+            F32(pc.inj + uint64_t(b) * uint64_t(pc.st)).v[gl_LocalInvocationID.x] =
+                2.0 / (1.0 + exp(-F32(pc.injl + uint64_t(b) * uint64_t(pc.st)).v[gl_LocalInvocationID.x] / float(C)));
+}

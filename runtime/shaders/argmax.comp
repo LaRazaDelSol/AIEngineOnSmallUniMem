@@ -1,0 +1,41 @@
+#version 460
+// Greedy argmax over n logits; one workgroup of 1024. Writes [token, bits(max)] to out.
+#include "common.glsl"
+layout(local_size_x = 1024) in;
+layout(push_constant) uniform PC { uint64_t logits; uint64_t outp; uint n; uint want_sum; } pc;  // S18: want_sum -> out[2] = sum exp(l - max)
+shared float bv[16];
+shared uint bi[16];
+void main() {
+    const uint i0 = gl_LocalInvocationID.x;
+    F32 L = F32(pc.logits);
+    float best = -1e30;
+    uint idx = 0u;
+    for (uint i = i0; i < pc.n; i += 1024u) { const float v = L.v[i]; if (v > best) { best = v; idx = i; } }
+    const float m = subgroupMax(best);
+    const uint mi = subgroupMin(best == m ? idx : 0xFFFFFFFFu);
+    if (gl_SubgroupInvocationID == 0u) { bv[gl_SubgroupID] = m; bi[gl_SubgroupID] = mi; }
+    barrier();
+    if (i0 == 0u) {
+        float b = -1e30;
+        uint k = 0u;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) if (bv[s] > b || (bv[s] == b && bi[s] < k)) { b = bv[s]; k = bi[s]; }
+        F32(pc.outp).v[1] = b;
+        F32(pc.outp).v[0] = uintBitsToFloat(k);
+        bv[0] = b;
+    }
+    if (pc.want_sum == 0u) return;
+    // S18 draft confidence: softmax top-1 probability = 1 / sum exp(l - max) (the logits are L2-resident by now)
+    barrier();
+    const float b = bv[0];
+    float se = 0.0;
+    for (uint i = i0; i < pc.n; i += 1024u) se += exp(L.v[i] - b);
+    se = subgroupAdd(se);
+    barrier();
+    if (gl_SubgroupInvocationID == 0u) bv[gl_SubgroupID] = se;
+    barrier();
+    if (i0 == 0u) {
+        float t = 0.0;
+        for (uint s = 0u; s < gl_NumSubgroups; ++s) t += bv[s];
+        F32(pc.outp).v[2] = t;
+    }
+}

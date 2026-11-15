@@ -1,0 +1,6 @@
+005000000: pattern held, restored to zero True
+009000000: pattern held, restored to zero True
+01b000000: pattern held, restored to zero True
+023000000: pattern held, restored to zero True
+025000000: pattern held, restored to zero True
+writable pages: 5 of 5

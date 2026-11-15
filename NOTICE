@@ -1,0 +1,22 @@
+Third-party material in this repository
+
+runtime/reference/modeling_qwen4_exp.py, modular_qwen4_exp.py, configuration_qwen4_exp.py, config.json
+  Copyright 2026 The Qwen Team and The HuggingFace Inc. team. Apache License 2.0
+  (http://www.apache.org/licenses/LICENSE-2.0). Reference model code, used to check the engine's output.
+
+runtime/tools/ps5lm_dash.py
+  Visual design, markdown renderer, sampling drawer and icons adapted from Strata
+  (https://github.com/niko1221/strata), Copyright (c) 2026 Niko1221 and the Strata contributors, MIT License.
+  Embedded Outfit font, Copyright 2021 The Outfit Project Authors, SIL Open Font License 1.1.
+  Full texts are served by the dashboard at /licenses.
+
+runtime/shaders/exl3_*.comp, exl3_common.glsl, runtime/src/exl3_bench.cpp, runtime/tools/s15/pack_exl3*.py,
+runtime/tools/s17/fetch_pack_exl3.py
+  Independent implementations of the EXL3 weight format (trellis decode, codebook, Hadamard rotation) as defined by
+  exllamav3 (https://github.com/turboderp-org/exllamav3), MIT License. No exllamav3 source code is included.
+
+scripts/console/s28/s28_mce_ro.c, scripts/console/s31/ps5lowmem.c
+  Linux kernel modules, GPL-2.0.
+
+Model weights are not included. Qwen3.8-Flash-Next and its EXL3 quantizations are distributed by their publishers
+under their own licenses.

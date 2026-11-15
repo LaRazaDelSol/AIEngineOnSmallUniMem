@@ -1,0 +1,43 @@
+#version 460
+// S18 stage C: matvec.comp (generic K) for NB token columns: each weight word is loaded once, every column keeps
+// matvec.comp's arithmetic (bit-identical). Column b: x + b*xs, y + b*ys (bytes). Used for the HC down/inject matrices.
+#define BITS 4
+#include "common.glsl"
+#ifndef NB
+#define NB 2
+#endif
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint64_t w; uint64_t x; uint64_t y; uint K; uint N; uint rpw; uint mode; float alpha; uint xs; uint ys; uint nb; } pc;
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint SW = scale_words(pc.K), RW = row_words(pc.K), QW = quant_words(pc.K);
+    U32 W = U32(pc.w);
+    const uint r0 = gl_WorkGroupID.x * pc.rpw;
+    for (uint rr = 0u; rr < pc.rpw; ++rr) {
+        const uint r = r0 + rr;
+        if (r >= pc.N) break;
+        const uint rb = r * RW;
+        float acc[NB];
+        [[unroll]] for (uint b = 0u; b < NB; ++b) acc[b] = 0.0;
+        for (uint w = lane; w < QW; w += 64u) {
+            const uint q = W.v[rb + SW + w];
+            const float bs = block_scale(W, rb, w);
+            [[unroll]] for (uint b = 0u; b < NB; ++b) {
+                float xv[16];
+                float sx;
+                load_x(V4(pc.x + uint64_t(b) * uint64_t(pc.xs)), w, xv, sx);
+                acc[b] += bs * word_dot(q, xv, sx);
+            }
+        }
+        [[unroll]] for (uint b = 0u; b < NB; ++b) {
+            const float a = subgroupAdd(acc[b]) * pc.alpha;
+            if (lane == 0u) {
+                F32 Y = F32(pc.y + uint64_t(b) * uint64_t(pc.ys));
+                float o = a;
+                if (pc.mode == 2u) o = a / (1.0 + exp(-a));
+                else if (pc.mode == 3u) o = 1.0 / (1.0 + exp(-a));
+                if (pc.mode == 1u) Y.v[r] += o; else Y.v[r] = o;
+            }
+        }
+    }
+}

@@ -1,0 +1,13 @@
+#version 460
+// S21 wide prefill: shared-expert activation for T tokens: h[t][r] = silu(g) * u * sg[t] (g = gu[t][r], u = gu[t][640+r],
+// sg = sigmoid(shared_expert_gate . x) from the N=1 GEMM). The down GEMM then accumulates onto the routed sum.
+#include "common.glsl"
+layout(local_size_x = 128) in;
+layout(push_constant) uniform PC { uint64_t gu; uint64_t sg; uint64_t h; uint gs; uint sgs; uint hs; uint pad; } pc;
+void main() {
+    const uint r = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    if (r >= FFN) return;
+    F32 G = F32(pc.gu + uint64_t(t) * uint64_t(pc.gs));
+    const float g = G.v[r], u = G.v[FFN + r];
+    F32(pc.h + uint64_t(t) * uint64_t(pc.hs)).v[r] = g / (1.0 + exp(-g)) * u * F32(pc.sg + uint64_t(t) * uint64_t(pc.sgs)).v[0];
+}

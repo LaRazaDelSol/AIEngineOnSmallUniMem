@@ -1,0 +1,20 @@
+#version 460
+// S17 hyper-connection pre-step (hc_mode 3), part 1: per-256-element partial sums of x^2 of the 4 x 2560 streams
+// (40 chunks, chunk j belongs to stream j / 10). Consumers (hc_down2 / hc_upmix2) add a stream's 10 partials in
+// index order -> deterministic 1/rms without a 4-workgroup two-pass norm kernel.
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t x; uint64_t psum; } pc;
+shared float part[4];
+void main() {
+    const uint i = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    const float t = F32(pc.x).v[i];
+    float s = subgroupAdd(t * t);
+    if (gl_SubgroupInvocationID == 0u) part[gl_SubgroupID] = s;
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        float tot = 0.0;
+        for (uint k = 0u; k < gl_NumSubgroups; ++k) tot += part[k];
+        F32(pc.psum).v[gl_WorkGroupID.x] = tot;
+    }
+}

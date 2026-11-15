@@ -1,0 +1,23 @@
+# /etc/systemd/system/ps5lowmem.service — S31: the firmware-reserved low gigabyte (0x01000000-0x3FFFFFFF) as CPU-only
+# memory. The GPU cannot access that range (S25 machine checks, S26-S31), so nothing here ever gives it to the page
+# allocator: the module maps it write-back for the CPU and exposes
+#   /dev/ps5lowswap  (first SWAP_MIB): swap, so the front end / system pages there instead of being OOM-killed, and the
+#                    engine's pool reserve can shrink (zswap off: it would compress swapped pages into normal RAM,
+#                    the very memory this frees; there is no other swap device on the console)
+#   /dev/ps5lowmem   (the rest): the engine's second expert tier (--tier /dev/ps5lowmem), reached by CPU memcpy only
+# Module: /home/steam/ps5lm/s31/ps5lowmem.ko (scripts/console/s31, built against the running kernel).
+[Unit]
+Description=PS5 reserved low gigabyte: CPU-only swap + expert tier
+Before=ps5lm-server.service
+ConditionPathExists=/home/steam/ps5lm/s31/ps5lowmem.ko
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=SWAP_MIB=256
+EnvironmentFile=-/etc/ps5lm/lowmem.env
+ExecStart=/bin/sh -c 'lsmod | grep -q "^ps5lowmem " || insmod /home/steam/ps5lm/s31/ps5lowmem.ko swap_mib=$SWAP_MIB; if [ "$SWAP_MIB" -gt 0 ]; then echo N > /sys/module/zswap/parameters/enabled 2>/dev/null; udevadm settle; mkswap -q /dev/ps5lowswap && swapon -p 100 /dev/ps5lowswap; fi; chmod 0600 /dev/ps5lowmem 2>/dev/null; true'
+ExecStop=/bin/sh -c 'swapoff /dev/ps5lowswap 2>/dev/null; rmmod ps5lowmem 2>/dev/null; true'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,87 @@
+#version 460
+// S33 QSA indexer block scores for decode / verify, one thread per block. idx_score.comp staged 64 keys per chunk in LDS
+// (50 KB per workgroup: one workgroup per CU, load and compute serialised), 158 us per attention layer at 197k positions
+// for a T = 2 verify (77 GB/s). Here every thread reads its own block's 256 B key straight from pk and scores all T
+// columns per key element (each key is read once per verify), with only the queries in LDS: many waves per CU keep the
+// loads in flight. The per-column arithmetic is idx_score's / idx_select's: acc[h] += dot(q[h][j], key[j]) for j = 0..31 in
+// order, then the relu sum times 1/sqrt(128). Same push constants and columns as idx_score.comp: column t's activations
+// at +t * S (qi, params, scratch); blocks completed inside the batch (>= bnew, <= 2) are pooled here from the raw keys
+// with idx_select's arithmetic (pk's bits); a column with <= 512 complete blocks is dense: skipped.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#ifndef RKR
+#define RKR 1024u   // S30: rk ring positions (flash_engine.hpp kRkRing)
+#endif
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer V4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer H16 { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer PK4 { f16vec4 v[]; };  // pooled keys fp16
+layout(push_constant) uniform PC { uint64_t qi0; uint64_t pk; uint64_t rk; uint64_t knw; uint64_t par0; uint64_t scr0;
+                                   uint S; uint T; uint nwg; float eps; float theta; uint pad; } pc;
+const uint TOPB = 512u;
+shared vec4 qs[8][4][32];        // [column][head][dim / 4]
+shared vec4 knew[2][32];         // blocks bnew, bnew + 1 (completed inside the batch), pooled
+void main() {
+    const uint tid = gl_LocalInvocationID.x, lane = gl_SubgroupInvocationID, wave = gl_SubgroupID;
+    const uint T = min(pc.T, 8u);
+    const uint pos0 = U32(pc.par0).v[0];
+    const uint bnew = pos0 / 4u;
+    const uint nbmax = (pos0 + T) / 4u;
+    if (nbmax <= TOPB || gl_WorkGroupID.x * 256u >= nbmax) return;
+    uint nbc[8];
+    [[unroll]] for (uint c = 0u; c < 8u; ++c) {
+        nbc[c] = 0u;
+        if (c < T) {
+            const uint p = U32(pc.par0 + uint64_t(c) * uint64_t(pc.S)).v[0];
+            nbc[c] = (p + 1u) / 4u;
+            if (nbc[c] <= TOPB) nbc[c] = 0u;
+        }
+    }
+    for (uint i = tid; i < T * 128u; i += 256u) {
+        const uint c = i >> 7, r = i & 127u;
+        qs[c][r >> 5][r & 31u] = V4(pc.qi0 + uint64_t(c) * uint64_t(pc.S)).v[r];
+    }
+    if (wave < 2u && bnew + wave < nbmax) {          // idx_score's / idx_select's pooling of an in-batch block
+        const uint b = bnew + wave;
+        H16 R = H16(pc.rk);
+        float a0 = 0.0, a1 = 0.0;
+        for (uint j = 0u; j < 4u; ++j) { const uint rr = ((4u * b + j) & (RKR - 1u)) * 128u; a0 += float(R.v[rr + lane]); a1 += float(R.v[rr + lane + 64u]); }
+        a0 *= 0.25; a1 *= 0.25;
+        const float ss = subgroupAdd(a0 * a0 + a1 * a1);
+        const float inv = inversesqrt(ss / 128.0 + pc.eps);
+        a0 = a0 * inv * (1.0 + F32(pc.knw).v[lane]);
+        a1 = a1 * inv * (1.0 + F32(pc.knw).v[lane + 64u]);
+        const float partner = subgroupShuffleXor(a0, 32u);
+        const uint f = lane & 31u;
+        const float ang = float(4u * b) * pow(pc.theta, -float(2u * f) / 64.0);
+        const float c = cos(ang), sn = sin(ang);
+        a0 = lane < 32u ? a0 * c - partner * sn : a0 * c + partner * sn;
+        a0 = float(float16_t(a0)); a1 = float(float16_t(a1));   // pk's bits
+        knew[wave][lane >> 2][lane & 3u] = a0;
+        knew[wave][(lane + 64u) >> 2][lane & 3u] = a1;
+    }
+    barrier();
+    PK4 P4 = PK4(pc.pk);
+    for (uint b = gl_WorkGroupID.x * 256u + tid; b < nbmax; b += pc.nwg * 256u) {
+        float acc[8][4];
+        [[unroll]] for (uint c = 0u; c < 8u; ++c) [[unroll]] for (uint h = 0u; h < 4u; ++h) acc[c][h] = 0.0;
+        const bool cached = b < bnew;
+        for (uint j = 0u; j < 32u; ++j) {
+            const vec4 kv = cached ? vec4(P4.v[b * 32u + j]) : knew[b - bnew][j];
+            [[unroll]] for (uint c = 0u; c < 8u; ++c)
+                if (c < T) [[unroll]] for (uint h = 0u; h < 4u; ++h) acc[c][h] += dot(qs[c][h][j], kv);
+        }
+        [[unroll]] for (uint c = 0u; c < 8u; ++c) {
+            if (b >= nbc[c]) continue;
+            const float s = (max(acc[c][0], 0.0) + max(acc[c][1], 0.0) + max(acc[c][2], 0.0) + max(acc[c][3], 0.0)) * 0.08838834764831845;
+            U32(pc.scr0 + uint64_t(c) * uint64_t(pc.S)).v[b] = floatBitsToUint(s);
+        }
+    }
+}

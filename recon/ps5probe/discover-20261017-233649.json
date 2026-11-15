@@ -1,0 +1,65 @@
+{
+ "ts": "20261017-233649",
+ "mode": "discover-session",
+ "subnet": "10.0.0.0/24",
+ "pc_ip": "10.0.0.123 (this machine; sshd banner OpenSSH_for_Windows_9.5 = self, not PS5)",
+ "hosts": [
+  {
+   "ip": "10.0.0.1",
+   "services": [
+    "http:80 XFINITY router"
+   ],
+   "is_ps5": false
+  },
+  {
+   "ip": "10.0.0.23",
+   "services": [
+    "80 Caddy",
+    "443 Caddy",
+    "8000 PS5-Relapse staging page (SimpleHTTP/Python 3.14.8)",
+    "8080 qBittorrent WebUI",
+    "8888 Go proxy"
+   ],
+   "is_ps5": false,
+   "note": "LAN machine hosting the Relapse exploit page for the console browser"
+  },
+  {
+   "ip": "10.0.0.113",
+   "mac": "5c-84-3c-48-36-fb (Sony Interactive Entertainment OUI)",
+   "is_ps5": true,
+   "arp": "present/dynamic = console powered & on LAN",
+   "ports_open": [],
+   "ports_probed_slowly": [
+    22,
+    21,
+    80,
+    443,
+    1337,
+    139,
+    4444,
+    5001,
+    5353,
+    6800,
+    6970,
+    8000,
+    8001,
+    8080,
+    8888,
+    9021,
+    9090,
+    50000,
+    54433
+   ],
+   "verdict": "console ONLINE but jailbreak NOT active this boot: elfldr 9021 closed, Pegasus 6970 closed -> autoloader packages (K Stuff Lite, ShadowMountPlus, ps5upload) never fired"
+  }
+ ],
+ "actions": [
+  "discover scan (read-only)",
+  "deep port/banner fingerprint of .23 and .123 (read-only)",
+  "native probe attempt vs 10.0.0.113:6970 -> connection refused (no JB)"
+ ],
+ "probe_safety_review": {
+  "fix_applied": "copytest: keep-both same-dir copy + delete of original path would have DELETED the source game file (Pegasus ops log proves keep-both renames in-dir copies). Now: copy targets an empty ps5-probe sandbox on the source mount, free-space headroom guard (>=5 GiB), file-size band 1 GiB..64 GiB (target ~8 GiB), ShadowMount image mounts and other unclassified mounts excluded, op error status surfaced.",
+  "verdict": "no probe writes outside <mount>/ps5-probe/ or ps5probe-scratch/; no firmware/kernel/PSN paths touched; discover is SYN-only; nothing can brick the console."
+ }
+}

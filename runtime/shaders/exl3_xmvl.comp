@@ -1,0 +1,147 @@
+#version 460
+// S22 chunk-wide expert-major MoE: the EXL3 trellis matvec as an LDS-tiled GEMM over (pair x column) tiles.
+// exl3_xmvw decodes every trellis tile once per entry of <= 16 pairs inside one wave and pays ~10.5 VALU ops per weight
+// for the decode against <= 16 FMAs: the routed MoE of the S21 wide prefill ran at ~29% of the fp32 peak.
+// Here a 128-thread workgroup owns one entry of <= PT pairs (all of one expert) x BN = 128 output columns: per BK-row K
+// step its 4 waves decode the step's (BK/16) x 8 trellis tiles ONCE (exl3_xmvw's window math, tile_dec_s) into LDS as
+// fp32 (1024 + s), the pairs' x rows are staged transposed next to them, and each thread accumulates a PP = PT/8 pair x
+// 8 column register tile from ds_read_b128s (S22 ISA: a 4 x 8 tile of 256 threads read 0.375 LDS floats per FMA through
+// ds_read_b64s and was LDS-bandwidth bound; 8 x 8 reads 0.25). The next step's trellis words and x are loaded into
+// registers while the current step computes (one LDS buffer, two barriers per step, as gemm_q4.comp).
+// Output = K_INV * acc + K_BIAS * sum(x). Not bit-identical to exl3_xmvw (fp32 sum order), same arithmetic per product.
+// Entry e (16 bytes): slot | n | p0: pairs plist[p0 .. p0 + n); pair q's x at xin + q * xstride (+ m * xs_m floats),
+// its output at out + q * ostride (+ m * os_m + column floats). Grid (N / 128, matrices, entries).
+#include "exl3_common.glsl"
+#ifndef PT
+#define PT 64
+#endif
+#ifndef BKS
+#define BKS 32
+#endif
+const uint NT = 128u;              // threads
+const uint PP = PT / 8u;           // pairs per thread (8 pair groups x 16 column groups)
+const uint BN = 128u, BK = BKS, KTS = BK / 16u;
+const uint WS4 = BN / 4u + 1u;     // Ws row stride in vec4 (rows r0 = 0, 2, 4, 6 of a decode store land 8 banks apart)
+const uint XS4 = PT / 4u;          // Xs row stride in vec4
+const uint SKN = BK * PT / NT;     // x floats per staging thread per step
+const uint TPW = 2u * KTS;         // trellis tiles decoded per wave per step (column tiles wv and wv + 4)
+layout(local_size_x = 128) in;
+layout(push_constant) uniform PC {
+    uint64_t ents; uint64_t xin; uint64_t out_addr; uint64_t plist;
+    uint kt; uint nt; uint tr_off0; uint tr_off1; uint xs_m; uint os_m; uint xstride; uint ostride;
+} pc;
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Ent { uint64_t slot; uint n; uint p0; };
+shared vec4 Ws4[BK * WS4];
+shared vec4 Xs4[BK * XS4];
+shared float Sp[NT];
+
+void wput(uint r, uint c, float v) { Ws4[r * WS4 + (c >> 2u)][c & 3u] = v; }
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, lane = tid & 31u, wv = tid >> 5u;
+    const uint nb = gl_WorkGroupID.x, m = gl_WorkGroupID.y;
+    Ent en = Ent(pc.ents + uint64_t(gl_WorkGroupID.z) * 16ul);
+    const uint64_t sa = en.slot;
+    if (sa == 0ul) return;
+    const uint n = min(en.n, PT), p0 = en.p0;
+    // decode role: wave wv -> column tiles nb * 8 + wv (+ 4), row tiles KTS s .. KTS s + KTS - 1 of step s
+    const GeomS q = tile_geom_s(lane);
+    const uint64_t tstride = uint64_t(pc.nt) * TW * 4u;
+    uint64_t tile = sa + uint64_t(m == 0u ? pc.tr_off0 : pc.tr_off1) + uint64_t(nb * 8u + wv) * TW * 4u;
+    const uint64_t t4 = 4ul * TW * 4u;   // column tile wv + 4
+    const uint r0 = (lane & 3u) * 2u, c0 = wv * 16u + (lane >> 2u);
+    // staging role: pair sp, floats sk .. sk + SKN - 1 of the step (a wave stores consecutive pairs of one row)
+    const uint sp = tid % PT, sk = (tid / PT) * SKN;
+    const bool sok = sp < n;
+    uint64_t xp = 0ul;
+    if (sok) xp = pc.xin + uint64_t(U32(pc.plist).v[p0 + sp]) * uint64_t(pc.xstride) + uint64_t((m * pc.xs_m + sk) * 4u);
+    // compute role: pairs pg * PP .. + PP - 1, columns cg * 8 .. + 7
+    const uint pg = tid & 7u, cg = tid >> 3u;
+    float acc[PP][8];
+    [[unroll]] for (uint i = 0u; i < PP; ++i) [[unroll]] for (uint j = 0u; j < 8u; ++j) acc[i][j] = 0.0;
+    float sx = 0.0;
+    const uint ns = pc.kt / KTS;
+    TWords A[TPW];
+    [[unroll]] for (uint kk = 0u; kk < KTS; ++kk) {
+        A[2u * kk] = tile_load_s(tile + uint64_t(kk) * tstride, q);
+        A[2u * kk + 1u] = tile_load_s(tile + uint64_t(kk) * tstride + t4, q);
+    }
+    vec2 xr[SKN / 2u];
+    [[unroll]] for (uint i = 0u; i < SKN / 2u; ++i) xr[i] = sok ? V2(xp + uint64_t(8u * i)).v[0] : vec2(0.0);
+    for (uint s = 0u; s < ns; ++s) {
+        barrier();
+        [[unroll]] for (uint j = 0u; j < TPW; ++j) {
+            float d[8];
+            tile_dec_s(A[j], q, d);
+            const uint rb = (j >> 1u) * 16u + r0, c = c0 + (j & 1u) * 64u;
+            [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                const uint r = rb + (i & 1u) + (i >> 1u) * 8u;
+                wput(r, c, d[i]);
+                wput(r, c + 8u, d[i + 4u]);
+            }
+        }
+        [[unroll]] for (uint i = 0u; i < SKN / 2u; ++i) {
+            const uint r = sk + 2u * i;
+            Xs4[r * XS4 + (sp >> 2u)][sp & 3u] = xr[i].x;
+            Xs4[(r + 1u) * XS4 + (sp >> 2u)][sp & 3u] = xr[i].y;
+            sx += xr[i].x + xr[i].y;
+        }
+        barrier();
+        if (s + 1u < ns) {
+            tile += uint64_t(KTS) * tstride;
+            [[unroll]] for (uint kk = 0u; kk < KTS; ++kk) {
+                A[2u * kk] = tile_load_s(tile + uint64_t(kk) * tstride, q);
+                A[2u * kk + 1u] = tile_load_s(tile + uint64_t(kk) * tstride + t4, q);
+            }
+            xp += uint64_t(BK * 4u);
+            [[unroll]] for (uint i = 0u; i < SKN / 2u; ++i) xr[i] = sok ? V2(xp + uint64_t(8u * i)).v[0] : vec2(0.0);
+        }
+        [[unroll]] for (uint k = 0u; k < BK; ++k) {
+            const vec4 wa = Ws4[k * WS4 + cg * 2u], wb = Ws4[k * WS4 + cg * 2u + 1u];
+            [[unroll]] for (uint i4 = 0u; i4 < PP / 4u; ++i4) {
+                const vec4 xv = Xs4[k * XS4 + (pg * PP) / 4u + i4];
+                [[unroll]] for (uint ii = 0u; ii < 4u; ++ii) {
+                    const uint i = i4 * 4u + ii;
+                    acc[i][0] = fma(wa.x, xv[ii], acc[i][0]); acc[i][1] = fma(wa.y, xv[ii], acc[i][1]);
+                    acc[i][2] = fma(wa.z, xv[ii], acc[i][2]); acc[i][3] = fma(wa.w, xv[ii], acc[i][3]);
+                    acc[i][4] = fma(wb.x, xv[ii], acc[i][4]); acc[i][5] = fma(wb.y, xv[ii], acc[i][5]);
+                    acc[i][6] = fma(wb.z, xv[ii], acc[i][6]); acc[i][7] = fma(wb.w, xv[ii], acc[i][7]);
+                }
+            }
+#if PT == 16
+            {
+                const vec4 xv = Xs4[k * XS4 + pg / 2u];
+                const vec2 x2 = (pg & 1u) == 0u ? xv.xy : xv.zw;
+                [[unroll]] for (uint i = 0u; i < 2u; ++i) {
+                    acc[i][0] = fma(wa.x, x2[i], acc[i][0]); acc[i][1] = fma(wa.y, x2[i], acc[i][1]);
+                    acc[i][2] = fma(wa.z, x2[i], acc[i][2]); acc[i][3] = fma(wa.w, x2[i], acc[i][3]);
+                    acc[i][4] = fma(wb.x, x2[i], acc[i][4]); acc[i][5] = fma(wb.y, x2[i], acc[i][5]);
+                    acc[i][6] = fma(wb.z, x2[i], acc[i][6]); acc[i][7] = fma(wb.w, x2[i], acc[i][7]);
+                }
+            }
+#endif
+        }
+    }
+    // sum(x) of each pair: the NT / PT staging threads of a pair, in a fixed order
+    barrier();
+    Sp[tid] = sx;
+    barrier();
+    float sxp[PP];
+    [[unroll]] for (uint i = 0u; i < PP; ++i) {
+        const uint p = pg * PP + i;
+        float t = 0.0;
+        [[unroll]] for (uint j = 0u; j < NT / PT; ++j) t += Sp[p + j * PT];
+        sxp[i] = t;
+    }
+    [[unroll]] for (uint i = 0u; i < PP; ++i) {
+        const uint p = pg * PP + i;
+        if (p < n) {
+            const float bias = K_BIAS * sxp[i];
+            const uint64_t o = pc.out_addr + uint64_t(U32(pc.plist).v[p0 + p]) * uint64_t(pc.ostride) + uint64_t((m * pc.os_m + nb * BN + cg * 8u) * 4u);
+            F32(o).v[0] = K_INV * acc[i][0] + bias; F32(o).v[1] = K_INV * acc[i][1] + bias;
+            F32(o).v[2] = K_INV * acc[i][2] + bias; F32(o).v[3] = K_INV * acc[i][3] + bias;
+            F32(o).v[4] = K_INV * acc[i][4] + bias; F32(o).v[5] = K_INV * acc[i][5] + bias;
+            F32(o).v[6] = K_INV * acc[i][6] + bias; F32(o).v[7] = K_INV * acc[i][7] + bias;
+        }
+    }
+}

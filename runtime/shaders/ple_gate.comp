@@ -1,0 +1,22 @@
+#version 460
+// Qwen4ExpTextPLELayer gate: per stream c (WG per c):
+//   g = sum_i keyn[c,i] * qn[c,i] / sqrt(H);  g = sign(g) * sqrt(max(|g|, 1e-6));  gv[c,i] = sigmoid(g) * value[i]
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t keyn; uint64_t qn; uint64_t value; uint64_t gv; } pc;
+shared float red[4];
+void main() {
+    const uint c = gl_WorkGroupID.x, i0 = gl_LocalInvocationID.x;
+    F32 Kn = F32(pc.keyn), Qn = F32(pc.qn), Vl = F32(pc.value), G = F32(pc.gv);
+    float s = 0.0;
+    for (uint i = i0; i < HIDDEN; i += 256u) s += Kn.v[c * HIDDEN + i] * Qn.v[c * HIDDEN + i];
+    s = subgroupAdd(s);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = s;
+    barrier();
+    float g = 0.0;
+    for (uint t = 0u; t < gl_NumSubgroups; ++t) g += red[t];
+    g /= sqrt(float(HIDDEN));
+    g = sign(g) * sqrt(max(abs(g), 1e-6));
+    const float sg = 1.0 / (1.0 + exp(-g));
+    for (uint i = i0; i < HIDDEN; i += 256u) G.v[c * HIDDEN + i] = sg * Vl.v[i];
+}

@@ -1,0 +1,20 @@
+{
+  "schema": "ps5lm-gate-report/1",
+  "verdict": "PASS",
+  "hit_rate": 0.9113,
+  "gate_hit": 0.8,
+  "projected_tok_s": 102.91,
+  "tok_s_target": 20.0,
+  "cache_gib": 8.0,
+  "cache_slots_total": 7477,
+  "g_gib_per_token": 0.565,
+  "bw_gib_s": 5.1583999999999985,
+  "expert_reads_total": 960000,
+  "pack_bytes": 28231925760,
+  "pack_gib": 26.29,
+  "trace": {
+    "profile": "agent",
+    "seed": 7,
+    "tokens": 2000
+  }
+}

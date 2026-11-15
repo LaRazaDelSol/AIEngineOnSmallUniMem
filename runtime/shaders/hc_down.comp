@@ -1,0 +1,79 @@
+#version 460
+// S15 fused hyper-connection pre-step, part 1 (replaces hc_norm + matvec(down, silu) + matvec(inj)):
+//   normed = Qwen4ExpTextRMSNorm(H) per stream group of 2560 (eps, weight 1+w)
+//   t[r]    = silu(alpha * down[r] . normed)       r < 320
+//   injl[j] = inj[j] . normed                      j < n_inj (4 or 0)
+// Every workgroup recomputes the 4 group norms (80 KB of L2 reads, trivial) and stages `normed` in LDS once, so the
+// 324 rows read x from LDS instead of 40 KB of L2 traffic per wave. WG 0 also writes `normed` for hc_upmix.
+// Bit-exact with the 4-kernel path: the norm reduction order is hc_norm.comp's (256 threads, wave64 partials in
+// subgroup order) and each row is one wave with matvec.comp's lane/word order and float expressions.
+#define BITS 4
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t h; uint64_t nw; uint64_t wdown; uint64_t winj; uint64_t t; uint64_t injl; uint64_t normed;
+    uint rows_per_wg; uint n_inj; float alpha; float eps;
+} pc;
+const uint G = 2560u, C = 4u, KD = 10240u, NDOWN = 320u;
+shared vec4 xs[KD / 4u];
+shared float part[4][8];
+void main() {
+    const uint tid = gl_LocalInvocationID.x, lane = gl_SubgroupInvocationID, wave = gl_SubgroupID;
+    F32 Hs = F32(pc.h), NW = F32(pc.nw);
+    [[unroll]] for (uint c = 0u; c < C; ++c) {
+        float s = 0.0;
+        for (uint i = tid; i < G; i += 256u) { float v = Hs.v[c * G + i]; s += v * v; }
+        s = subgroupAdd(s);
+        if (lane == 0u) part[c][wave] = s;
+    }
+    barrier();
+    float inv[4];
+    [[unroll]] for (uint c = 0u; c < C; ++c) {
+        float tot = 0.0;
+        for (uint k = 0u; k < gl_NumSubgroups; ++k) tot += part[c][k];
+        inv[c] = inversesqrt(tot / float(G) + pc.eps);
+    }
+    const bool w0 = gl_WorkGroupID.x == 0u;
+    F32 NO = F32(pc.normed);
+    V4 H4 = V4(pc.h), NW4 = V4(pc.nw);
+    for (uint q = tid; q < KD / 4u; q += 256u) {  // same per-element expression as hc_norm.comp, 4 at a time
+        const vec4 hv = H4.v[q], wv = NW4.v[q];
+        const float iv = inv[(q * 4u) / G];
+        const vec4 v = vec4(hv.x * iv * (1.0 + wv.x), hv.y * iv * (1.0 + wv.y), hv.z * iv * (1.0 + wv.z), hv.w * iv * (1.0 + wv.w));
+        xs[q] = v;
+        if (w0) { NO.v[4u * q] = v.x; NO.v[4u * q + 1u] = v.y; NO.v[4u * q + 2u] = v.z; NO.v[4u * q + 3u] = v.w; }
+    }
+    barrier();
+    const uint SW = scale_words(KD), RW = row_words(KD), QW = quant_words(KD);
+    const uint nrows = NDOWN + pc.n_inj;
+    const uint r0 = gl_WorkGroupID.x * pc.rows_per_wg;
+    for (uint rr = wave; rr < pc.rows_per_wg; rr += gl_NumSubgroups) {
+        const uint r = r0 + rr;
+        if (r >= nrows) break;
+        const bool dn = r < NDOWN;
+        U32 W = U32(dn ? pc.wdown : pc.winj);
+        const uint rb = (dn ? r : r - NDOWN) * RW;
+        float acc = 0.0;
+        for (uint w = lane; w < QW; w += 64u) {
+            float xv[16];
+            float sx = 0.0;
+            [[unroll]] for (uint g = 0u; g < 4u; ++g) {
+                if (g < VPW / 4u) {
+                    const vec4 t4 = xs[elem_of(w, 4u * g) >> 2];
+                    xv[4u * g + 0u] = t4.x; xv[4u * g + 1u] = t4.y; xv[4u * g + 2u] = t4.z; xv[4u * g + 3u] = t4.w;
+                    sx += t4.x + t4.y + t4.z + t4.w;
+                } else {
+                    xv[4u * g + 0u] = 0.0; xv[4u * g + 1u] = 0.0; xv[4u * g + 2u] = 0.0; xv[4u * g + 3u] = 0.0;
+                }
+            }
+            acc += block_scale(W, rb, w) * word_dot(W.v[rb + SW + w], xv, sx);
+        }
+        if (dn) {
+            acc = subgroupAdd(acc) * pc.alpha;
+            if (lane == 0u) F32(pc.t).v[r] = acc / (1.0 + exp(-acc));
+        } else {
+            acc = subgroupAdd(acc) * 1.0;
+            if (lane == 0u) F32(pc.injl).v[r - NDOWN] = acc;
+        }
+    }
+}

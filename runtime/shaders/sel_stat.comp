@@ -1,0 +1,43 @@
+#version 460
+// S32 tiering probe (PS5LM_SELSTAT=1, measurement only): how recently was each block the QSA indexer selects for this
+// token selected before? One workgroup per attention layer per decoded token, after idx_select, reading its list
+// (sel[0] = count, 0 = dense; sel[1..] = positions, a selected block contributes 4 consecutive positions 4b..4b+3).
+// last[b] = (position of the token that last selected block b) + 1, 0 = never. Counters cnt[0..8]:
+//   0 never selected before, 1 by the previous token, 2 age <= 4, 3 <= 16, 4 <= 64, 5 <= 256, 6 older,
+//   7 inside the newest WIN positions (always resident under tiering), 8 tokens counted, 9 tokens seen.
+// The first token after the probe starts only fills last[] (its history is empty), it is not counted.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer RU { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer WU { uint v[]; };
+layout(push_constant) uniform PC { uint64_t sel; uint64_t params; uint64_t last; uint64_t cnt; uint win; uint pad; } pc;
+shared uint seen;
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    WU C = WU(pc.cnt), Lb = WU(pc.last);
+    if (tid == 0u) seen = C.v[9];
+    barrier();
+    const uint ns = RU(pc.sel).v[0];
+    const uint pos = RU(pc.params).v[0];
+    if (ns != 0u) {
+        for (uint i = tid; i < ns; i += 256u) {
+            const uint p = RU(pc.sel).v[1u + i];
+            if ((p & 3u) != 0u) continue;
+            const uint b = p >> 2;
+            if (seen != 0u) {
+                uint k;
+                if (p + pc.win > pos) k = 7u;
+                else {
+                    const uint pr = Lb.v[b];
+                    const uint age = pos + 1u - pr;
+                    k = pr == 0u ? 0u : age <= 1u ? 1u : age <= 4u ? 2u : age <= 16u ? 3u : age <= 64u ? 4u : age <= 256u ? 5u : 6u;
+                }
+                atomicAdd(C.v[k], 1u);
+            }
+            Lb.v[b] = pos + 1u;
+        }
+    }
+    barrier();
+    if (tid == 0u) { C.v[9] = seen + 1u; if (seen != 0u && ns != 0u) C.v[8] += 1u; }
+}

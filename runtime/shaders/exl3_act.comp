@@ -1,0 +1,39 @@
+#version 460
+// S15b EXL3 expert activation, all in one 128-block: g = H128(pre_g) * svh_g, u = H128(pre_u) * svh_u,
+// h = silu(g) * u, hd = H128(h * suh_down)  (the down projection's transformed input).
+// Grid (5 blocks of 640, K experts), 128 threads. pre layout [e][2][640], hd layout [e][640].
+#include "exl3_common.glsl"
+layout(local_size_x = 128) in;
+layout(push_constant) uniform PC { uint64_t pre; uint64_t slots; uint64_t hd; } pc;
+shared float sg[128], su[128];
+
+void main() {
+    const uint i = gl_LocalInvocationID.x, b = gl_WorkGroupID.x, e = gl_WorkGroupID.y;
+    const uint64_t sa = U64(pc.slots).v[e];
+    if (sa == 0ul) return;
+    const uint n = b * 128u + i;
+    float g = F32(pc.pre).v[e * 1280u + n], u = F32(pc.pre).v[e * 1280u + 640u + n];
+    sg[i] = g; su[i] = u;
+    barrier();
+    [[unroll]] for (uint h = 1u; h < 128u; h <<= 1) {
+        const float og = sg[i ^ h], ou = su[i ^ h];
+        barrier();
+        g = (i & h) == 0u ? g + og : og - g;
+        u = (i & h) == 0u ? u + ou : ou - u;
+        sg[i] = g; su[i] = u;
+        barrier();
+    }
+    g *= RSQRT128 * float(H16(sa + OFF_G_SVH).v[n]);
+    u *= RSQRT128 * float(H16(sa + OFF_U_SVH).v[n]);
+    float v = g / (1.0 + exp(-g)) * u * float(H16(sa + OFF_D_SUH).v[n]);
+    sg[i] = v;
+    barrier();
+    [[unroll]] for (uint h = 1u; h < 128u; h <<= 1) {
+        const float o = sg[i ^ h];
+        barrier();
+        v = (i & h) == 0u ? v + o : o - v;
+        sg[i] = v;
+        barrier();
+    }
+    F32(pc.hd).v[e * 640u + n] = v * RSQRT128;
+}

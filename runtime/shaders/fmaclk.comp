@@ -1,0 +1,18 @@
+#version 460
+// S15b: effective GPU clock probe. 16 independent fp32 FMA chains per thread (enough ILP to saturate RDNA's
+// 2 x SIMD32 per CU); FLOP/s / (CUs x 128 FLOP/clk) = effective shader clock. Result is written so nothing is DCE'd.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430) buffer F32 { float v[]; };
+layout(push_constant) uniform PC { uint64_t out_addr; uint iters; float seed; } pc;
+void main() {
+    vec4 a = vec4(pc.seed + float(gl_LocalInvocationID.x) * 1e-7), b = a + 0.1, c = a + 0.2, d = a + 0.3;
+    const vec4 m = vec4(0.999999), k = vec4(1e-7);
+    for (uint i = 0u; i < pc.iters; ++i) {
+        a = fma(a, m, k); b = fma(b, m, k); c = fma(c, m, k); d = fma(d, m, k);
+        a = fma(a, m, k); b = fma(b, m, k); c = fma(c, m, k); d = fma(d, m, k);
+    }
+    const float r = dot(a + b + c + d, vec4(1.0));
+    if (r == 12345.678) F32(pc.out_addr).v[gl_GlobalInvocationID.x] = r;  // never true; keeps the math live
+}

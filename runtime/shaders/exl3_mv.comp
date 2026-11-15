@@ -1,0 +1,106 @@
+#version 460
+// S15b microbenchmark: EXL3 "mul1" trellis matvec on GFX1013 (no DP4A), gate_up-shaped (2560 -> 640 per matrix).
+// Byte-preserving: reads EXL3's own trellis layout [k/16][n/16][16*K uint16] (tail-biting 256-weight tiles, tensor-core
+// permutation inside the tile: positions t*8+0..3 = rows r0,r0+1,r0+8,r0+9 at col c0; +4..7 the same rows at c0+8,
+// with r0 = (t%4)*2, c0 = t/4). One wave32 per 16-column output tile; lane t decodes positions t*8..t*8+7 of every
+// k-tile (exllamav3 dq8, align 4), so the bitstream is never reordered.
+// mul1 value = (bytesum(idx * 0x83DCD12D) - 510) / 147.7. The affine part is folded out: the kernel accumulates
+// sum(bytesum * x) and the caller applies k_inv and the per-matrix -510*k_inv*sum(x) bias.
+//   VARIANT 0: 32-bit multiply (v_mul_lo_u32, quarter rate)   VARIANT 1: 24-bit split multiply (full-rate ops)
+//   VARIANT 2: 4-bit nibble baseline in the same loop (PS5Q4-class decode cost, 32 dwords per tile)
+//   VARIANT 3: packed pairs: two 24-bit muls + one v_pk_mul_lo_u16 give both products' bytes, a SWAR byte sum lands
+//              [1024+s0, 1024+s1] as fp16 bit patterns (0x6400 trick, no convert), mixed-precision FMA accumulates.
+//              Result = sum((1024+s)*x): the caller removes 1024*sum(x) together with the -510 bias.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 32) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer V2 { vec2 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v[]; };
+layout(push_constant) uniform PC { uint64_t trel; uint64_t x; uint64_t out_addr; } pc;
+
+#ifndef VARIANT
+#define VARIANT 0
+#endif
+const uint KT = 160u, NT = 40u;           // 2560/16 k-tiles, 640/16 n-tiles
+#if VARIANT == 2
+const uint TW = 32u;                      // 4 bits x 256 / 32
+#else
+const uint TW = 24u;                      // 3 bits x 256 / 32
+#endif
+
+uint bytesum_mul1(uint w) {
+    w &= 0xFFFFu;
+#if VARIANT == 1
+    uint p = w * 0xDCD12Du + ((w * 0x83u) << 24);
+#else
+    uint p = w * 0x83DCD12Du;
+#endif
+    uint s = (p & 0x00FF00FFu) + ((p >> 8) & 0x00FF00FFu);
+    return (s & 0xFFFFu) + (s >> 16);
+}
+
+// two mul1 windows -> packed fp16 bit patterns [1024 + bytesum(wa*C), 1024 + bytesum(wb*C)]
+uint pair_mul1(uint wa, uint wb) {
+    wa &= 0xFFFFu; wb &= 0xFFFFu;
+    const uint xa = wa * 0xD12Du, xb = wb * 0xD12Du;                 // exact 16x16 products (low half of C)
+    const u16vec2 ch = unpack16(wa | (wb << 16)) * u16vec2(0x83DCus); // (w * C_hi) mod 2^16, both at once
+    const uint plo = (xa & 0xFFFFu) | (xb << 16);                      // product bits 0..15 of a | of b
+    const uint phi = pack32(unpack16((xa >> 16) | (xb & 0xFFFF0000u)) + ch);  // product bits 16..31
+    return (plo & 0x00FF00FFu) + ((plo >> 8) & 0x00FF00FFu) + (phi & 0x00FF00FFu) + ((phi >> 8) & 0x00FF00FFu) + 0x64006400u;
+}
+
+void main() {
+    const uint t = gl_SubgroupInvocationID, nt = gl_WorkGroupID.x, m = gl_WorkGroupID.y;
+    const uint r0 = (t & 3u) * 2u;
+    U32 W = U32(pc.trel);
+    V2 X = V2(pc.x);
+    const uint mbase = m * KT * NT * TW;
+    const uint xbase = m * 1280u;          // vec2 index of this matrix's (pre-transformed) input
+#if VARIANT != 2
+    // per-lane constant window geometry (exllamav3 dq8<3, cb, 4>)
+    const int b1 = int(t * 8u + 257u) * 3, b0 = b1 - 16, b2 = b1 + 21;
+    const uint i0 = uint(b0 >> 5) % TW, i2 = uint((b2 - 1) >> 5) % TW;
+    const uint s2 = uint(((b2 - 1) >> 5) + 1) * 32u - uint(b2);
+#endif
+    float acc0 = 0.0, acc1 = 0.0;
+    for (uint kt = 0u; kt < KT; ++kt) {
+        const uint tb = mbase + (kt * NT + nt) * TW;
+        const vec2 xa = X.v[xbase + kt * 8u + (r0 >> 1)], xb = X.v[xbase + kt * 8u + (r0 >> 1) + 4u];
+        float d[8];
+#if VARIANT == 2
+        const uint q = W.v[tb + t];
+        [[unroll]] for (uint j = 0u; j < 8u; ++j) d[j] = float((q >> (4u * j)) & 15u);
+#elif VARIANT == 3
+        const uint a = W.v[tb + i0], b = W.v[tb + i2];
+        const uint64_t v = (uint64_t(a) << 32) | uint64_t(b);
+        const uint w7 = uint(v >> s2), w3 = uint(v >> (s2 + 12u));
+        const f16vec2 h01 = unpackFloat2x16(pair_mul1(w3 >> 9, w3 >> 6)), h23 = unpackFloat2x16(pair_mul1(w3 >> 3, w3));
+        const f16vec2 h45 = unpackFloat2x16(pair_mul1(w7 >> 9, w7 >> 6)), h67 = unpackFloat2x16(pair_mul1(w7 >> 3, w7));
+        d[0] = float(h01.x); d[1] = float(h01.y); d[2] = float(h23.x); d[3] = float(h23.y);
+        d[4] = float(h45.x); d[5] = float(h45.y); d[6] = float(h67.x); d[7] = float(h67.y);
+#else
+        const uint a = W.v[tb + i0], b = W.v[tb + i2];
+        const uint64_t v = (uint64_t(a) << 32) | uint64_t(b);
+        const uint w7 = uint(v >> s2), w3 = uint(v >> (s2 + 12u));
+        d[7] = float(bytesum_mul1(w7));       d[6] = float(bytesum_mul1(w7 >> 3));
+        d[5] = float(bytesum_mul1(w7 >> 6));  d[4] = float(bytesum_mul1(w7 >> 9));
+        d[3] = float(bytesum_mul1(w3));       d[2] = float(bytesum_mul1(w3 >> 3));
+        d[1] = float(bytesum_mul1(w3 >> 6));  d[0] = float(bytesum_mul1(w3 >> 9));
+#endif
+        acc0 += d[0] * xa.x + d[1] * xa.y + d[2] * xb.x + d[3] * xb.y;
+        acc1 += d[4] * xa.x + d[5] * xa.y + d[6] * xb.x + d[7] * xb.y;
+    }
+    acc0 += subgroupShuffleXor(acc0, 1u); acc1 += subgroupShuffleXor(acc1, 1u);
+    acc0 += subgroupShuffleXor(acc0, 2u); acc1 += subgroupShuffleXor(acc1, 2u);
+    if ((t & 3u) == 0u) {
+        const uint c0 = t >> 2;
+        F32(pc.out_addr).v[m * 640u + nt * 16u + c0] = acc0;
+        F32(pc.out_addr).v[m * 640u + nt * 16u + c0 + 8u] = acc1;
+    }
+}

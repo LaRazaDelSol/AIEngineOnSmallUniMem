@@ -1,0 +1,35 @@
+#version 460
+// out[r] = resid[r] + sum_e wt[e] * (down_e[r] . h_e)  -- deterministic, no atomics.
+// One wave64 per row; lanes stride the concatenated (expert, word) space.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC {
+    uint64_t h; uint64_t slots; uint64_t wt; uint64_t resid; uint64_t outp; uint n_exp; uint rows_per_wg;
+} pc;
+
+const uint QW = (FFN / 32u) * QWPB;   // 80 (Q4) / 40 (Q2)
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint SW = scale_words(FFN), RW = row_words(FFN), RWH = row_words(HIDDEN);
+    const uint down_off = 2u * FFN * RWH;   // words
+    U64 S = U64(pc.slots);
+    F32 WT = F32(pc.wt);
+    const uint total = pc.n_exp * QW;
+    const uint r0 = gl_WorkGroupID.x * pc.rows_per_wg;
+    for (uint rr = 0u; rr < pc.rows_per_wg; ++rr) {
+        const uint r = r0 + rr;
+        if (r >= HIDDEN) break;
+        const uint rb = down_off + r * RW;
+        float acc = 0.0;
+        for (uint idx = lane; idx < total; idx += 64u) {
+            const uint e = idx / QW, w = idx - e * QW;
+            U32 W = U32(S.v[e]);
+            float xv[16];
+            float sx;
+            load_x(V4(pc.h + uint64_t(e * FFN * 4u)), w, xv, sx);
+            acc += WT.v[e] * block_scale(W, rb, w) * word_dot(W.v[rb + SW + w], xv, sx);
+        }
+        acc = subgroupAdd(acc);
+        if (lane == 0u) F32(pc.outp).v[r] = F32(pc.resid).v[r] + acc;
+    }
+}

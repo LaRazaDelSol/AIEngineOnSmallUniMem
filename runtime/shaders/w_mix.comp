@@ -1,0 +1,19 @@
+#version 460
+// S21 wide prefill: the stream mix of hc_upmix4.comp for T tokens. u = sigmoid(up . t) per (stream c, i) from the up GEMM
+// (row c*2560 + i), n = the normalised streams: x[i] = (sum_c u[c][i] * n[c][i]) / 4 (same order as hc_upmix4). With il != 0
+// also inj[c] = 2 sigmoid(il[c] / 4). Grid (2560 / 256, T).
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t u; uint64_t n; uint64_t x; uint64_t il; uint64_t inj; uint us; uint ns; uint xs; uint ils; uint injs; uint pad; } pc;
+const uint H = 2560u, C = 4u;
+void main() {
+    const uint i = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    F32 U = F32(pc.u + uint64_t(t) * uint64_t(pc.us)), Nn = F32(pc.n + uint64_t(t) * uint64_t(pc.ns));
+    float a = 0.0;
+    [[unroll]] for (uint c = 0u; c < C; ++c) a += U.v[c * H + i] * Nn.v[c * H + i];
+    F32(pc.x + uint64_t(t) * uint64_t(pc.xs)).v[i] = a / float(C);
+    if (pc.il != 0ul && gl_WorkGroupID.x == 0u && gl_LocalInvocationID.x < C) {
+        const uint c = gl_LocalInvocationID.x;
+        F32(pc.inj + uint64_t(t) * uint64_t(pc.injs)).v[c] = 2.0 / (1.0 + exp(-F32(pc.il + uint64_t(t) * uint64_t(pc.ils)).v[c] / float(C)));
+    }
+}

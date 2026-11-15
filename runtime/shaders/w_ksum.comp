@@ -1,0 +1,18 @@
+#version 460
+// S21 split-K reduction of gemm_q4 partials: y[t][r] = epi(alpha * sum_z part[z][t][r]) (part rows: (z*T + t) * ps bytes).
+// Grid (ceil(N / 256), T).
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t part; uint64_t y; uint N; uint T; uint ks; uint mode; float alpha; uint ps; uint ys; uint pad; } pc;
+void main() {
+    const uint r = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    if (r >= pc.N) return;
+    float a = 0.0;
+    for (uint z = 0u; z < pc.ks; ++z) a += F32(pc.part + uint64_t(z * pc.T + t) * uint64_t(pc.ps)).v[r];
+    a *= pc.alpha;
+    float o = a;
+    if (pc.mode == 2u) o = a / (1.0 + exp(-a));
+    else if (pc.mode == 3u) o = 1.0 / (1.0 + exp(-a));
+    F32 Y = F32(pc.y + uint64_t(t) * uint64_t(pc.ys));
+    if (pc.mode == 1u) Y.v[r] += o; else Y.v[r] = o;
+}

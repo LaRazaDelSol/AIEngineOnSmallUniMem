@@ -1,0 +1,17 @@
+#version 460
+// PLE short conv for one decode step (depthwise, kernel 4, dilation 3 => taps t-9, t-6, t-3, t) + SiLU, then
+//   H[ch] += gv[ch] + silu(conv(gvn)[ch]).   state[ch][0..8] = previous 9 gvn values (oldest first).
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t gvn; uint64_t gv; uint64_t w; uint64_t state; uint64_t h; uint64_t state_out; uint n; } pc;
+void main() {
+    const uint ch = gl_GlobalInvocationID.x;
+    if (ch >= pc.n) return;
+    F32 X = F32(pc.gvn), Wt = F32(pc.w), S = F32(pc.state), Hs = F32(pc.h), SO = F32(pc.state_out);  // S16: state_out may != state
+    const uint sb = ch * 9u;
+    const float x = X.v[ch];
+    const float a = Wt.v[ch * 4u] * S.v[sb] + Wt.v[ch * 4u + 1u] * S.v[sb + 3u] + Wt.v[ch * 4u + 2u] * S.v[sb + 6u] + Wt.v[ch * 4u + 3u] * x;
+    for (uint t = 0u; t < 8u; ++t) SO.v[sb + t] = S.v[sb + t + 1u];
+    SO.v[sb + 8u] = x;
+    Hs.v[ch] += F32(pc.gv).v[ch] + a / (1.0 + exp(-a));
+}

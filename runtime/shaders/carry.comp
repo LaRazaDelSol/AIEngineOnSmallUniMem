@@ -1,0 +1,16 @@
+#version 460
+// S20 layer-major prefill: moves the 4-stream residual H of the T tokens of group g between the per-token carry buffer and
+// the activation blocks (dir 0: carry -> blocks, 1: blocks -> carry). g is read from a host-written word, so ONE recorded
+// command buffer per layer serves every group of the chunk.
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t carry; uint64_t blk; uint64_t gword; uint stride; uint n; uint T; uint dir; } pc;
+void main() {
+    const uint i = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    if (i >= pc.n || t >= pc.T) return;
+    const uint g = U32(pc.gword).v[0];
+    F32 C = F32(pc.carry + (uint64_t(g * pc.T + t) * uint64_t(pc.n)) * 4ul);
+    F32 B = F32(pc.blk + uint64_t(t) * uint64_t(pc.stride));
+    if (pc.dir == 0u) B.v[i] = C.v[i];
+    else C.v[i] = B.v[i];
+}

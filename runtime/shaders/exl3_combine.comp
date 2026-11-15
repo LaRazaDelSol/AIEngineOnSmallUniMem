@@ -1,0 +1,29 @@
+#version 460
+// S15b EXL3 routed-expert combine: out[n] = sum_e w[e] * H128(yd[e])[n] * svh_down[e][n]  (n over 2560, 128-blocks).
+// Writes the routed sum (the shared expert's PS5Q4 down pass then accumulates onto it, as for the PS5Q packs).
+// Grid (20 blocks), 128 threads. yd layout [e][2560]; wt[e] = routing weight (same table as the PS5Q path).
+#include "exl3_common.glsl"
+layout(local_size_x = 128) in;
+layout(push_constant) uniform PC { uint64_t yd; uint64_t slots; uint64_t wt; uint64_t out_addr; uint nexp; } pc;
+shared float sh[128];
+
+void main() {
+    const uint i = gl_LocalInvocationID.x, n = gl_WorkGroupID.x * 128u + i;
+    float acc = 0.0;
+    for (uint e = 0u; e < pc.nexp; ++e) {
+        const uint64_t sa = U64(pc.slots).v[e];   // uniform across the workgroup
+        float v = F32(pc.yd).v[e * 2560u + n];
+        sh[i] = v;
+        barrier();
+        [[unroll]] for (uint h = 1u; h < 128u; h <<= 1) {
+            const float o = sh[i ^ h];
+            barrier();
+            v = (i & h) == 0u ? v + o : o - v;
+            sh[i] = v;
+            barrier();
+        }
+        if (sa != 0ul) acc += F32(pc.wt).v[e] * v * RSQRT128 * float(H16(sa + OFF_D_SVH).v[n]);
+        barrier();
+    }
+    F32(pc.out_addr).v[n] = acc;
+}

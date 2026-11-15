@@ -1,0 +1,18 @@
+#version 460
+// causal_conv1d_update for one decode step + SiLU (GatedDeltaNet q/k/v channels).
+//   seq = [state0, state1, state2, x];  out = silu(sum_k w[ch][k] * seq[k]);  state_out <- seq[1..3]
+// S16: state_out may differ from state (verify checkpoints); each channel is read before it is written by the same thread.
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t x; uint64_t w; uint64_t state; uint64_t outp; uint64_t state_out; uint n; } pc;
+void main() {
+    const uint ch = gl_GlobalInvocationID.x;
+    if (ch >= pc.n) return;
+    F32 X = F32(pc.x), Wt = F32(pc.w), S = F32(pc.state), O = F32(pc.outp), SO = F32(pc.state_out);
+    const float s0 = S.v[ch * 3u], s1 = S.v[ch * 3u + 1u], s2 = S.v[ch * 3u + 2u], xv = X.v[ch];
+    const float a = Wt.v[ch * 4u] * s0 + Wt.v[ch * 4u + 1u] * s1 + Wt.v[ch * 4u + 2u] * s2 + Wt.v[ch * 4u + 3u] * xv;
+    O.v[ch] = a / (1.0 + exp(-a));
+    SO.v[ch * 3u] = s1;
+    SO.v[ch * 3u + 1u] = s2;
+    SO.v[ch * 3u + 2u] = xv;
+}

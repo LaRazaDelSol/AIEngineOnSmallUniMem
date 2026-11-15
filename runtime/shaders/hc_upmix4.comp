@@ -1,0 +1,53 @@
+#version 460
+// S19: hc_upmix.comp with OPW outputs per wave. The lane's x (its one quant word of the rank-320 vector t, 8 values +
+// sx via load_x) is loaded ONCE, the 4 * OPW rows' quant + scale words are issued back to back (saddr form), then each
+// row is reduced and mixed exactly as hc_upmix.comp does it (acc = 0 + scale * word_dot, the same subgroupAdd, mix
+// sums c = 0..3 in order): bit-identical.
+#define BITS 4
+#include "common.glsl"
+#ifndef OPW
+#define OPW 4
+#endif
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t w; uint64_t t; uint64_t normed; uint64_t xout; uint64_t injl; uint64_t inj; } pc;
+const uint H = 2560u, C = 4u, KU = 320u;
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint i0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * OPW;
+    const uint SW = scale_words(KU), RW = row_words(KU), QW = quant_words(KU);   // QW = 40: lanes 40..63 idle
+    const bool act = lane < QW;
+    float xv[16];
+    float sx = 0.0;
+    if (act) load_x(V4(pc.t), lane, xv, sx);
+    else { [[unroll]] for (uint v = 0u; v < 16u; ++v) xv[v] = 0.0; }
+    uint q[OPW][4], sw[OPW][4];
+    const uint qoff = (SW + lane) * 4u, soff = ((lane / QWPB) >> 1) * 4u;
+    [[unroll]] for (uint o = 0u; o < OPW; ++o)
+        [[unroll]] for (uint c = 0u; c < C; ++c) {
+            const uint64_t rp = pc.w + uint64_t(c * H + i0 + o) * uint64_t(RW * 4u);
+            q[o][c] = act ? U32(rp + uint64_t(qoff)).v[0] : 0u;
+            sw[o][c] = act ? U32(rp + uint64_t(soff)).v[0] : 0u;
+        }
+    F32 Nn = F32(pc.normed);
+    [[unroll]] for (uint o = 0u; o < OPW; ++o) {
+        const uint i = i0 + o;
+        float sig[4];
+        [[unroll]] for (uint c = 0u; c < C; ++c) {
+            float acc = 0.0;
+            if (act) {
+                const vec2 s2 = unpackHalf2x16(sw[o][c]);
+                const float bs = ((lane / QWPB) & 1u) != 0u ? s2.y : s2.x;
+                acc += bs * word_dot(q[o][c], xv, sx);
+            }
+            acc = subgroupAdd(acc) * 1.0;
+            sig[c] = 1.0 / (1.0 + exp(-acc));
+        }
+        if (lane == 0u && i < H) {
+            float a = 0.0;
+            [[unroll]] for (uint c = 0u; c < C; ++c) a += sig[c] * Nn.v[c * H + i];
+            F32(pc.xout).v[i] = a / float(C);
+        }
+    }
+    if (pc.injl != 0ul && gl_WorkGroupID.x == 0u && gl_LocalInvocationID.x < C)
+        F32(pc.inj).v[gl_LocalInvocationID.x] = 2.0 / (1.0 + exp(-F32(pc.injl).v[gl_LocalInvocationID.x] / float(C)));
+}

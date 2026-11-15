@@ -1,0 +1,24 @@
+#version 460
+// S21 wide prefill: gdn_convb.comp for nt tokens (any count): input x + t*xs, output outp + t*os, the conv state read once
+// and written once at the end (no per-token checkpoints in prefill). Per token the arithmetic is gdn_conv.comp's.
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t x; uint64_t w; uint64_t state; uint64_t outp; uint n; uint xs; uint os; uint nt; } pc;
+void main() {
+    const uint ch = gl_GlobalInvocationID.x;
+    if (ch >= pc.n) return;
+    F32 Wt = F32(pc.w), S = F32(pc.state);
+    float s0 = S.v[ch * 3u], s1 = S.v[ch * 3u + 1u], s2 = S.v[ch * 3u + 2u];
+    const float w0 = Wt.v[ch * 4u], w1 = Wt.v[ch * 4u + 1u], w2 = Wt.v[ch * 4u + 2u], w3 = Wt.v[ch * 4u + 3u];
+    float xn = pc.nt > 0u ? F32(pc.x).v[ch] : 0.0;
+    for (uint t = 0u; t < pc.nt; ++t) {
+        const float xv = xn;
+        if (t + 1u < pc.nt) xn = F32(pc.x + uint64_t(t + 1u) * uint64_t(pc.xs)).v[ch];
+        const float a = w0 * s0 + w1 * s1 + w2 * s2 + w3 * xv;
+        F32(pc.outp + uint64_t(t) * uint64_t(pc.os)).v[ch] = a / (1.0 + exp(-a));
+        s0 = s1; s1 = s2; s2 = xv;
+    }
+    S.v[ch * 3u] = s0;
+    S.v[ch * 3u + 1u] = s1;
+    S.v[ch * 3u + 2u] = s2;
+}

@@ -1,0 +1,46 @@
+Module                  Size  Used by
+snd_hrtimer            16384  1
+snd_seq               110592  6
+snd_timer              45056  2 snd_seq,snd_hrtimer
+snd_seq_device         16384  1 snd_seq
+snd                   135168  5 snd_seq,snd_seq_device,snd_timer
+soundcore              16384  1 snd
+joydev                 32768  0
+uinput                 24576  1
+algif_hash             16384  0
+algif_skcipher         12288  0
+af_alg                 28672  2 algif_hash,algif_skcipher
+sch_fq_codel           24576  6
+hid_playstation        45056  0
+led_class_multicolor    16384  1 hid_playstation
+hid                   274432  1 hid_playstation
+ff_memless             24576  1 hid_playstation
+crypto_user            16384  0
+nls_iso8859_1          12288  1
+amd_atl                65536  1
+moal                 1118208  1
+mlan                  819200  1 moal
+cfg80211             1368064  1 moal
+k10temp                12288  0
+mts                    32768  0
+overlay               200704  0
+autofs4                49152  2
+nvme                   61440  1
+aesni_intel            86016  0
+gf128mul               12288  1 aesni_intel
+nvme_core             196608  2 nvme
+ahci_salina_drv        12288  0
+libahci                57344  1 ahci_salina_drv
+amdgpu              19841024  1
+i2c_algo_bit           16384  1 amdgpu
+drm_buddy              12288  1 amdgpu
+drm_ttm_helper         20480  2 amdgpu
+ttm                   147456  2 amdgpu,drm_ttm_helper
+video                  73728  1 amdgpu
+drm_exec               12288  1 amdgpu
+drm_suballoc_helper    24576  1 amdgpu
+mfd_core               12288  1 amdgpu
+drm_panel_backlight_quirks    12288  1 amdgpu
+gpu_sched              65536  1 amdgpu
+amdxcp                 12288  1 amdgpu
+drm_display_helper    237568  1 amdgpu

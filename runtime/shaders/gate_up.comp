@@ -1,0 +1,40 @@
+#version 460
+// h[e*FFN + r] = silu(gate_e[r] . x) * (up_e[r] . x) for the experts bound in `slots`.
+// One wave64 per (row block, expert); x stays in registers across the block's rows.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint64_t x; uint64_t h; uint64_t slots; uint rows_per_wg; } pc;
+
+const uint QW = (HIDDEN / 32u) * QWPB;   // 320 (Q4) / 160 (Q2)
+const uint ITERS = (QW + 63u) / 64u;     // 5 / 3
+void main() {
+    const uint lane = gl_SubgroupInvocationID, e = gl_WorkGroupID.y;
+    const uint SW = scale_words(HIDDEN), RW = row_words(HIDDEN);
+    const uint64_t sa = U64(pc.slots).v[e];
+    if (sa == 0ul) return;  // S15 overlap: this expert runs in the other (resident / streamed) pass
+    U32 W = U32(sa);
+    V4 X = V4(pc.x);
+    float xv[ITERS][16];
+    float sx[ITERS];
+    [[unroll]] for (uint it = 0u; it < ITERS; ++it) {
+        uint w = lane + 64u * it;
+        if (w < QW) load_x(X, w, xv[it], sx[it]);
+        else { sx[it] = 0.0; [[unroll]] for (uint v = 0u; v < 16u; ++v) xv[it][v] = 0.0; }
+    }
+    const uint r0 = gl_WorkGroupID.x * pc.rows_per_wg;
+    for (uint rr = 0u; rr < pc.rows_per_wg; ++rr) {
+        const uint r = r0 + rr;
+        if (r >= FFN) break;
+        const uint gb = r * RW, ub = (FFN + r) * RW;
+        float g = 0.0, u = 0.0;
+        [[unroll]] for (uint it = 0u; it < ITERS; ++it) {
+            uint w = lane + 64u * it;
+            if (w < QW) {
+                g += block_scale(W, gb, w) * word_dot(W.v[gb + SW + w], xv[it], sx[it]);
+                u += block_scale(W, ub, w) * word_dot(W.v[ub + SW + w], xv[it], sx[it]);
+            }
+        }
+        vec2 gu = subgroupAdd(vec2(g, u));
+        if (lane == 0u) F32(pc.h).v[e * FFN + r] = gu.x / (1.0 + exp(-gu.x)) * gu.y;
+    }
+}

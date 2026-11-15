@@ -1,0 +1,48 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "ps5",
+      "displayName": "PS5 console (CachyOS/Arch, linux-ps5, RADV GFX1013)",
+      "description": "The serving build: Release, -O3 -march=znver2, Vulkan compute + io_uring. Matches ~/ps5lm/build14 on the console.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/../build/ps5",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "PS5LM_HIP": "OFF",
+        "PS5LM_BUILD_BENCH": "ON"
+      }
+    },
+    {
+      "name": "ps5-serve",
+      "displayName": "PS5 console, engine + shaders only",
+      "inherits": "ps5",
+      "binaryDir": "${sourceDir}/../build/ps5-serve",
+      "cacheVariables": { "PS5LM_BUILD_BENCH": "OFF" }
+    },
+    {
+      "name": "host",
+      "displayName": "Any host (Windows/Linux/macOS): portable tests only",
+      "description": "slot cache, quant, trace replay. No GPU, no io_uring. What CI runs on every push.",
+      "binaryDir": "${sourceDir}/../build/host",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "PS5LM_HIP": "OFF", "PS5LM_NATIVE": "OFF" }
+    },
+    {
+      "name": "hip-legacy",
+      "displayName": "LEGACY: HIP/ROCm kernels (gfx1030 design point, S12)",
+      "description": "Not the PS5 path: the console GPU is GFX1013 (no ROCm target, no DP4A). Kept for the S12 design-point kernels only.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/../build/hip-legacy",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "PS5LM_HIP": "ON", "PS5LM_GPU_ARCH": "gfx1030" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "ps5", "configurePreset": "ps5" },
+    { "name": "ps5-serve", "configurePreset": "ps5-serve", "targets": ["flash_decode", "ps5lm_shaders"] },
+    { "name": "host", "configurePreset": "host" }
+  ],
+  "testPresets": [
+    { "name": "host", "configurePreset": "host", "output": { "outputOnFailure": true } }
+  ]
+}

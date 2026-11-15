@@ -1,0 +1,24 @@
+#version 460
+// S21 wide prefill: hc_norm.comp (GFIX 2560) for T tokens: grid (groups, T); token t reads x + t*xs, writes outp + t*os.
+// Per token the arithmetic is hc_norm2560's (bit-identical).
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t x; uint64_t w; uint64_t outp; uint xs; uint os; float eps; uint pad; } pc;
+shared float part[8];
+#ifndef GGW
+#define GGW 2560
+#endif
+const uint GG = GGW;  // S22: -DGGW=10240 = the MTP hidden norm (one group over the 4 streams)
+void main() {
+    const uint g = gl_WorkGroupID.x, t = gl_WorkGroupID.y, base = g * GG;
+    F32 X = F32(pc.x + uint64_t(t) * uint64_t(pc.xs)), Wt = F32(pc.w), O = F32(pc.outp + uint64_t(t) * uint64_t(pc.os));
+    float s = 0.0;
+    [[unroll]] for (uint i = gl_LocalInvocationID.x; i < GG; i += 256u) { float v = X.v[base + i]; s += v * v; }
+    s = subgroupAdd(s);
+    if (gl_SubgroupInvocationID == 0u) part[gl_SubgroupID] = s;
+    barrier();
+    float tot = 0.0;
+    for (uint i = 0u; i < gl_NumSubgroups; ++i) tot += part[i];
+    const float inv = inversesqrt(tot / float(GG) + pc.eps);
+    [[unroll]] for (uint i = gl_LocalInvocationID.x; i < GG; i += 256u) O.v[base + i] = X.v[base + i] * inv * (1.0 + Wt.v[base + i]);
+}

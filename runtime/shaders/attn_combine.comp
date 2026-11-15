@@ -1,0 +1,43 @@
+#version 460
+// Flash-decoding attention, pass 2 (S14): merge the per-chunk partials of attn_split.comp and apply the output
+// gate.  out[h][d] = (sum_c e^(m_c - M) o_c[d]) / (sum_c e^(m_c - M) l_c) * sigmoid(gate[h][d]).
+// WG per query head (24), thread per dim.
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t part; uint64_t g; uint64_t outp; uint64_t params; uint max_chunks; uint pad; uint64_t sel; } pc;
+const uint CH = 64u, PS = 258u;
+#ifdef VROT   // S20 k8v4: V was stored Hadamard-rotated; the attention output is rotated back (orthonormal FWHT /16)
+shared float ov[256];
+#endif
+void main() {
+    const uint h = gl_WorkGroupID.x, d = gl_LocalInvocationID.x;
+#ifdef SEL   // S19: QSA list length (0 = dense)
+    const uint ns = U32(pc.sel).v[0];
+    const uint n = ns != 0u ? ns : U32(pc.params).v[0] + 1u;
+#else
+    const uint n = U32(pc.params).v[0] + 1u;
+#endif
+    const uint nc = (n + CH - 1u) / CH;
+    F32 P = F32(pc.part);
+    const uint hb = h * pc.max_chunks * PS;
+    float M = -1e30;
+    for (uint c = 0u; c < nc; ++c) M = max(M, P.v[hb + c * PS]);
+    float L = 0.0, o = 0.0;
+    for (uint c = 0u; c < nc; ++c) {
+        const float w = exp(P.v[hb + c * PS] - M);
+        L += w * P.v[hb + c * PS + 1u];
+        o += w * P.v[hb + c * PS + 2u + d];
+    }
+#ifdef VROT
+    ov[d] = o / L;
+    for (uint hh = 1u; hh < 256u; hh <<= 1u) {
+        barrier();
+        if ((d & hh) == 0u) { const float a = ov[d], b = ov[d + hh]; ov[d] = a + b; ov[d + hh] = a - b; }
+    }
+    barrier();
+    o = ov[d] * 0.0625;
+    L = 1.0;
+#endif
+    const float gt = F32(pc.g).v[h * 256u + d];
+    F32(pc.outp).v[h * 256u + d] = o / L / (1.0 + exp(-gt));
+}

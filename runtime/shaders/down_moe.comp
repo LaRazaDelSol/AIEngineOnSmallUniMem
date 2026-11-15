@@ -1,0 +1,108 @@
+#version 460
+// Fused MoE tail (S14): routed down (RBITS = pack precision) + shared-expert down (PS5Q4) + combine + the
+// hyper-connection inject, in ONE dispatch. Replaces down_combine(routed) -> barrier -> down_combine(shared)
+// -> barrier -> hc_post -> barrier (46 + 7.7 + 1 us + 3 barriers per layer, S14 profile).
+//   y[r]        = sum_{e<n_exp} wt[e] * (down_e[r] . h_e) + wt[n_exp] * (down_shared[r] . h_shared)
+//   H[c*H + r] += y[r] * inj[c]                                      (c = 0..3, Qwen4ExpTextGatedResidual)
+// The old down kernel re-gathered x from the cache per quant word (64 B of activations per 4 B of weights);
+// here all n_exp+1 expert activations (11 x 640 floats = 28 KB) are staged in LDS once per workgroup.
+// 256 threads = 4 waves; each wave streams ROWS_PER_WAVE rows; lanes stride the (expert, word) space.
+#include "common.glsl"
+#ifndef RBITS
+#define RBITS 2
+#endif
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t h; uint64_t slots; uint64_t wt; uint64_t hs; uint64_t inj; uint n_exp; uint rows_per_wave; } pc;
+
+const uint SWF = 12u;                       // scale words of a K=640 row (40 B -> 48 B)
+#if RBITS == 4
+const uint RQWPB = 4u, RQW = 80u, RRW = 92u, RDOWN = 2u * 640u * 360u;
+const float RZERO = 8.0;
+#else
+const uint RQWPB = 2u, RQW = 40u, RRW = 52u, RDOWN = 2u * 640u * 200u;
+const float RZERO = 2.0;
+#endif
+const uint SQW = 80u, SRW = 92u, SDOWN = 2u * 640u * 360u;  // shared expert: always PS5Q4
+
+// LDS holds the activations SWIZZLED by quant word: xr[g][e*RQW + w] is the g-th vec4 that word w of expert e
+// multiplies, so consecutive lanes (consecutive words) read consecutive vec4s: no bank conflicts (the first
+// version indexed xs[e*160 + b*8 + j + k*g] directly and ran 78 us, slower than the 3 kernels it replaced).
+#if RBITS == 4
+const uint RG = 2u;
+#else
+const uint RG = 4u;
+#endif
+shared vec4 xr[RG * 10u * RQW];     // routed (n_exp <= 10)
+shared vec4 xsh[2u * SQW];          // shared expert (Q4: 2 groups)
+
+float scale_of(U32 W, uint rb, uint w, uint qwpb) {
+    const uint b = w / qwpb;
+    const vec2 s = unpackHalf2x16(W.v[rb + (b >> 1)]);
+    return (b & 1u) != 0u ? s.y : s.x;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, lane = gl_SubgroupInvocationID, wave = gl_SubgroupID;
+    const uint ne = pc.n_exp;
+    V4 Hm = V4(pc.h);
+    for (uint i = tid; i < RG * ne * RQW; i += 256u) {
+        const uint g = i / (ne * RQW), ew = i - g * (ne * RQW), e = ew / RQW, w = ew - e * RQW;
+        const uint b = w / RQWPB, j = w - b * RQWPB;
+        xr[g * (ne * RQW) + ew] = Hm.v[e * 160u + b * 8u + j + (RBITS == 4 ? 4u : 2u) * g];
+    }
+    for (uint i = tid; i < 2u * SQW; i += 256u) {
+        const uint g = i / SQW, w = i - g * SQW;
+        xsh[i] = Hm.v[ne * 160u + (w >> 2u) * 8u + (w & 3u) + 4u * g];
+    }
+    barrier();
+    U64 S = U64(pc.slots);
+    F32 WT = F32(pc.wt), Hs = F32(pc.hs), INJ = F32(pc.inj);
+    const uint r0 = (gl_WorkGroupID.x * gl_NumSubgroups + wave) * pc.rows_per_wave;
+    for (uint rr = 0u; rr < pc.rows_per_wave; ++rr) {
+        const uint r = r0 + rr;
+        if (r >= HIDDEN) break;
+        float acc = 0.0;
+        // ---- routed experts ----
+        for (uint idx = lane; idx < ne * RQW; idx += 64u) {
+            const uint e = idx / RQW, w = idx - e * RQW;
+            U32 W = U32(S.v[e]);
+            const uint rb = RDOWN + r * RRW;
+            const uint q = W.v[rb + SWF + w];
+            float dt = 0.0, sx = 0.0;
+#if RBITS == 4
+            [[unroll]] for (uint g = 0u; g < 2u; ++g) {
+                const vec4 x = xr[g * (ne * RQW) + idx];
+                dt += float((q >> (4u * g)) & 0xFu) * x.x + float((q >> (8u + 4u * g)) & 0xFu) * x.y
+                    + float((q >> (16u + 4u * g)) & 0xFu) * x.z + float((q >> (24u + 4u * g)) & 0xFu) * x.w;
+                sx += x.x + x.y + x.z + x.w;
+            }
+#else
+            [[unroll]] for (uint g = 0u; g < 4u; ++g) {
+                const vec4 x = xr[g * (ne * RQW) + idx];
+                dt += float((q >> (2u * g)) & 0x3u) * x.x + float((q >> (8u + 2u * g)) & 0x3u) * x.y
+                    + float((q >> (16u + 2u * g)) & 0x3u) * x.z + float((q >> (24u + 2u * g)) & 0x3u) * x.w;
+                sx += x.x + x.y + x.z + x.w;
+            }
+#endif
+            acc += WT.v[e] * scale_of(W, rb, w, RQWPB) * (dt - RZERO * sx);
+        }
+        // ---- shared expert (PS5Q4, slot table entry n_exp, activations at expert index n_exp) ----
+        {
+            U32 W = U32(S.v[ne]);
+            const uint rb = SDOWN + r * SRW;
+            for (uint w = lane; w < SQW; w += 64u) {
+                const uint q = W.v[rb + SWF + w];
+                float dt = 0.0, sx = 0.0;
+                [[unroll]] for (uint g = 0u; g < 2u; ++g) {
+                    const vec4 x = xsh[g * SQW + w];
+                    dt += float((q >> (4u * g)) & 0xFu) * x.x + float((q >> (8u + 4u * g)) & 0xFu) * x.y
+                        + float((q >> (16u + 4u * g)) & 0xFu) * x.z + float((q >> (24u + 4u * g)) & 0xFu) * x.w;
+                    sx += x.x + x.y + x.z + x.w;
+                }
+                acc += WT.v[ne] * scale_of(W, rb, w, 4u) * (dt - 8.0 * sx);
+            }
+        }
+        acc = subgroupAdd(acc);
+        if (lane < 4u) Hs.v[lane * HIDDEN + r] += acc * INJ.v[lane];
+    }
+}

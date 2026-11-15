@@ -1,0 +1,11 @@
+#version 460
+// S21 wide prefill: hc_post.comp for T tokens: H[t][c*2560+i] += y[t][i] * inj[t][c]. Grid (10240 / 256, T).
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t h; uint64_t y; uint64_t inj; uint hs; uint ys; uint is_; uint pad; } pc;
+void main() {
+    const uint j = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    const uint c = j / HIDDEN, i = j - c * HIDDEN;
+    F32 Hs = F32(pc.h + uint64_t(t) * uint64_t(pc.hs));
+    Hs.v[j] += F32(pc.y + uint64_t(t) * uint64_t(pc.ys)).v[i] * F32(pc.inj + uint64_t(t) * uint64_t(pc.is_)).v[c];
+}

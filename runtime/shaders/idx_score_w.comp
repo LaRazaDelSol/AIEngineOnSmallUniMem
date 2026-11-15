@@ -1,0 +1,60 @@
+#version 460
+// S33 QSA indexer block scores for the wide prefill, tiled. idx_select_w scored every block of a query inside the query's
+// own workgroup: at 194k positions each prefill token read all 48.6k pooled keys (12 MB per attention layer) through one
+// CU, i.e. a 512-token slice moved ~6 GB per layer. Here a grid of workgroups walks the blocks in chunks of 64; the
+// chunk's keys go to LDS once and are scored against up to 64 queries (groups of 16 held in LDS; the engine sends 32), so each key is read
+// once per 32 queries. The per-block arithmetic is idx_select's (same loop order, same sums, fp32 queries, fp16 keys
+// widened exactly), the scores land in each query's scratch row, and idx_select_wps runs the unchanged exact selection.
+// Every block a query sees is in pk: the POOL pass pooled the slice's blocks before this dispatch (idx_select_w's
+// in-batch pooling produces the same bits). Query y (< T) is token tok0 + y at position pos0 + y; a query with <= 512
+// complete blocks is dense and skipped.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_control_flow_attributes : require
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer V4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer PK4 { f16vec4 v[]; };  // pooled keys fp16
+layout(push_constant) uniform PC { uint64_t qi0; uint64_t pk; uint64_t scr0; uint qis; uint scrs; uint pos0; uint T; uint nwg; uint pad; } pc;
+const uint TOPB = 512u, CH = 64u, QG = 16u;
+shared f16vec4 kk[CH][33];       // the chunk's keys (fp16 = pk's bits), rows padded to 33 (lane-per-block reads off one bank)
+shared vec4 qs[QG][4][32];       // [query of the group][head][dim / 4], fp32 like idx_select's
+void main() {
+    const uint tid = gl_LocalInvocationID.x, lane = gl_SubgroupInvocationID, wave = gl_SubgroupID;
+    const uint T = min(pc.T, 64u);
+    const uint nbmax = (pc.pos0 + T) / 4u;             // the last query's complete blocks
+    if (nbmax <= TOPB) return;
+    PK4 P4 = PK4(pc.pk);
+    for (uint ch = gl_WorkGroupID.x; ch * CH < nbmax; ch += pc.nwg) {
+        const uint b0 = ch * CH;
+        barrier();                                     // the previous chunk's keys / queries are no longer read
+        for (uint i = tid; i < CH * 32u; i += 256u) {
+            const uint r = i >> 5, j = i & 31u, b = b0 + r;
+            if (b < nbmax) kk[r][j] = P4.v[b * 32u + j];
+        }
+        for (uint g = 0u; g < T; g += QG) {
+            const uint ng = min(QG, T - g);
+            if (g > 0u) barrier();                     // the previous group's queries are no longer read
+            for (uint i = tid; i < ng * 128u; i += 256u) {
+                const uint c = i >> 7, r = i & 127u;
+                qs[c][r >> 5][r & 31u] = V4(pc.qi0 + uint64_t(g + c) * uint64_t(pc.qis)).v[r];
+            }
+            barrier();
+            const uint b = b0 + lane;
+            for (uint c = wave; c < ng; c += 4u) {     // wave w scores queries w, w + 4, .. of the group
+                const uint y = g + c;
+                const uint nb = (pc.pos0 + y + 1u) / 4u;
+                if (nb <= TOPB || b >= nb) continue;
+                float acc[4] = {0.0, 0.0, 0.0, 0.0};
+                for (uint j = 0u; j < 32u; ++j) {
+                    const vec4 kv = vec4(kk[lane][j]);
+                    [[unroll]] for (uint h = 0u; h < 4u; ++h) acc[h] += dot(qs[c][h][j], kv);
+                }
+                const float s = (max(acc[0], 0.0) + max(acc[1], 0.0) + max(acc[2], 0.0) + max(acc[3], 0.0)) * 0.08838834764831845;
+                U32(pc.scr0 + uint64_t(y) * uint64_t(pc.scrs)).v[b] = floatBitsToUint(s);
+            }
+        }
+    }
+}

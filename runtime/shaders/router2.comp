@@ -1,0 +1,22 @@
+#version 460
+// S17: the layer's router AND the depth-1 predictor matrix in ONE dispatch (rows r < n_exp: w -> logits, r >= n_exp:
+// w2 -> logits2). Per-row code identical to router.comp, so both outputs are bit-identical to two router dispatches;
+// saves a launch + barrier per layer and lets the two top-k run as one dispatch (topk2.comp).
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint64_t w; uint64_t w2; uint64_t x; uint64_t logits; uint64_t logits2; uint n_exp; } pc;
+void main() {
+    const uint g = gl_WorkGroupID.x, lane = gl_SubgroupInvocationID;
+    const bool second = g >= pc.n_exp;
+    const uint r = second ? g - pc.n_exp : g;
+    U32 W = U32((second ? pc.w2 : pc.w) + uint64_t(r) * uint64_t(HIDDEN * 2u));
+    V4 X = V4(pc.x);
+    float acc = 0.0;
+    for (uint i = lane; i < HIDDEN / 4u; i += 64u) {
+        const uint a = W.v[2u * i], b = W.v[2u * i + 1u];
+        const vec4 w = vec4(uintBitsToFloat(a << 16), uintBitsToFloat(a & 0xFFFF0000u), uintBitsToFloat(b << 16), uintBitsToFloat(b & 0xFFFF0000u));
+        acc += dot(w, X.v[i]);
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0u) F32(second ? pc.logits2 : pc.logits).v[r] = acc;
+}

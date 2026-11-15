@@ -1,0 +1,37 @@
+#version 460
+// S19: ISA probe (RADV_DEBUG=shaders): which GLSL forms of the EXL3 decode primitives lower to single instructions.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_integer_dot_product : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+layout(push_constant) uniform PC { uint64_t a; uint64_t o; uint s; } pc;
+void main() {
+    U32 A = U32(pc.a), O = U32(pc.o);
+    const uint i = gl_GlobalInvocationID.x;
+    const uint a = A.v[i], b = A.v[i + 4096u], s = A.v[i + 8192u] & 31u;
+#if P == 1
+    O.v[i] = dotPacked4x8EXT(a, 0x01010101u) + 0x6400u;          // byte sum, non-saturating
+#elif P == 2
+    O.v[i] = dotPacked4x8AccSatEXT(a, 0x01010101u, 0x6400u);     // production
+#elif P == 3
+    O.v[i] = uint(((uint64_t(a) << 32) | uint64_t(b)) >> s);     // production funnel
+#elif P == 4
+    O.v[i] = s == 0u ? b : ((a << (32u - s)) | (b >> s));        // explicit funnel
+#elif P == 5
+    O.v[i] = (b >> s) | ((a << 1u) << (31u - s));                // funnel without the s==0 select
+#elif P == 6
+    O.v[i] = (a & 0xFFu) + ((a >> 8) & 0xFFu) + ((a >> 16) & 0xFFu) + (a >> 24) + 0x6400u;
+#elif P == 7
+    O.v[i] = (((a & 0xFFu) + ((a >> 8) & 0xFFu)) + (((a >> 16) & 0xFFu) + (a >> 24))) + 0x6400u;
+#elif P == 8
+    const uint lo = (a & 0x00FF00FFu) + ((a >> 8) & 0x00FF00FFu);   // two 9-bit pair sums
+    O.v[i] = (lo & 0xFFFFu) + (lo >> 16) + 0x6400u;
+#elif P == 9
+    O.v[i] = bitfieldExtract(a, 0, 8) + bitfieldExtract(a, 8, 8) + bitfieldExtract(a, 16, 8) + bitfieldExtract(a, 24, 8) + 0x6400u;
+#elif P == 10
+    // two weights at once: pair sums of a and b in 16-bit halves, + 0x6400 per half
+    const uint ea = (a & 0x00FF00FFu) + ((a >> 8) & 0x00FF00FFu), eb = (b & 0x00FF00FFu) + ((b >> 8) & 0x00FF00FFu);
+    O.v[i] = ((ea & 0xFFFFu) + (ea >> 16)) | (((eb & 0xFFFFu) + (eb >> 16)) << 16);
+#endif
+}

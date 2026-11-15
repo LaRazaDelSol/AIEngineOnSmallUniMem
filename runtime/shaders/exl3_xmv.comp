@@ -1,0 +1,148 @@
+#version 460
+// S15b EXL3 expert matvec in the transformed domain: out[e][m][n] = sum_k xt[e][m][k] * W_inner[k][n] for the experts
+// bound in `slots` (0 = skip). gate/up: kt=160, nt=40, 2 mats; down: kt=40, nt=160, 1 mat. One wave32 per two 16-col
+// output tiles; lane t decodes positions 8t..8t+7 of every k-tile (exllamav3 dq8 windows, tensor-core permutation:
+// rows r0,r0+1,r0+8,r0+9 x cols c0,c0+8 with r0 = (t%4)*2, c0 = t/4). Codebook affine folded out of the loop:
+//   sum_k v*x = K_INV * sum_k (1024+s)*x + K_BIAS * sum_k x
+// Microbenchmarked as exl3_mv2 v4 (S15b R47-M): 117 us per layer gate_up at K=3, byte-exact vs exllamav3 dq().
+#include "exl3_common.glsl"
+// S17: default = software pipeline distance 2 (K=3 158.2 -> 134.0 us/layer MoE, K=2.5 172.9 -> 156.1; bit-exact).
+// -DNOPIPE = the S15b loop, -DPIPE1 = distance 1.
+#if !defined(NOPIPE) && !defined(PIPE1) && !defined(PIPE2)
+#define PIPE2 1
+#endif
+layout(local_size_x = 32) in;
+layout(push_constant) uniform PC {
+    uint64_t slots; uint64_t xin; uint64_t out_addr;
+    uint kt; uint nt; uint tr_off0; uint tr_off1;
+    uint xs_e; uint xs_m; uint os_e; uint os_m;
+} pc;
+
+void main() {
+    const uint t = gl_SubgroupInvocationID, m = gl_WorkGroupID.y, e = gl_WorkGroupID.z;
+    const uint64_t sa = U64(pc.slots).v[e];
+    if (sa == 0ul) return;
+    const uint r0 = (t & 3u) * 2u;
+    const Geom g = tile_geom(t);
+    const uint nt0 = gl_WorkGroupID.x * 2u;
+    uint64_t tile = sa + uint64_t(m == 0u ? pc.tr_off0 : pc.tr_off1) + uint64_t(nt0) * TW * 4u;
+    const uint64_t tstride = uint64_t(pc.nt) * TW * 4u;
+    uint64_t px = pc.xin + uint64_t(e * pc.xs_e + m * pc.xs_m + r0) * 4ul;
+    float a00 = 0.0, a01 = 0.0, a10 = 0.0, a11 = 0.0, sx = 0.0;
+#ifdef NOPIPE
+    for (uint k = 0u; k < pc.kt; ++k) {
+        const vec2 xa = V2(px).v[0], xb = V2(px).v[4];   // rows r0, r0+1 | r0+8, r0+9 of this k-tile
+        sx += (xa.x + xa.y) + (xb.x + xb.y);
+        float d[8];
+        tile_dec(tile, g, d);
+        a00 += d[0] * xa.x + d[1] * xa.y + d[2] * xb.x + d[3] * xb.y;
+        a01 += d[4] * xa.x + d[5] * xa.y + d[6] * xb.x + d[7] * xb.y;
+        tile_dec(tile + TW * 4u, g, d);
+        a10 += d[0] * xa.x + d[1] * xa.y + d[2] * xb.x + d[3] * xb.y;
+        a11 += d[4] * xa.x + d[5] * xa.y + d[6] * xb.x + d[7] * xb.y;
+        tile += tstride;
+        px += 64ul;
+    }
+#elif defined(PIPE2) && !defined(XLEGACY)
+    // S19: PIPE2 with uniform-base addressing (tile and x bases in SGPRs, lane offsets fixed) + 32-bit funnels.
+    // Same words, same order of every float op as the S17 PIPE2 loop below: bit-identical.
+    const GeomS q = tile_geom_s(t);
+    const uint xo = r0 * 4u;
+    uint64_t xb = pc.xin + uint64_t((e * pc.xs_e + m * pc.xs_m) * 4u);
+    TWords A0 = tile_load_s(tile, q), A1 = tile_load_s(tile + TW * 4u, q);
+    TWords B0 = tile_load_s(tile + tstride, q), B1 = tile_load_s(tile + tstride + TW * 4u, q);
+    vec2 xa0 = V2(xb + uint64_t(xo)).v[0], xb0 = V2(xb + uint64_t(xo + 32u)).v[0];
+    vec2 xa1 = V2(xb + uint64_t(xo + 64u)).v[0], xb1 = V2(xb + uint64_t(xo + 96u)).v[0];
+    for (uint k = 0u; k < pc.kt; k += 2u) {
+        const uint kn = k + 2u < pc.kt ? 2u : 0u;
+        const uint64_t tn = tile + tstride * kn, xn = xb + 64ul * kn;
+        const TWords C0 = tile_load_s(tn, q), C1 = tile_load_s(tn + TW * 4u, q);
+        const TWords D0 = tile_load_s(tn + tstride, q), D1 = tile_load_s(tn + tstride + TW * 4u, q);
+        const vec2 na0 = V2(xn + uint64_t(xo)).v[0], nb0 = V2(xn + uint64_t(xo + 32u)).v[0];
+        const vec2 na1 = V2(xn + uint64_t(xo + 64u)).v[0], nb1 = V2(xn + uint64_t(xo + 96u)).v[0];
+        float d[8];
+        sx += (xa0.x + xa0.y) + (xb0.x + xb0.y);
+        tile_dec_s(A0, q, d);
+        a00 += d[0] * xa0.x + d[1] * xa0.y + d[2] * xb0.x + d[3] * xb0.y;
+        a01 += d[4] * xa0.x + d[5] * xa0.y + d[6] * xb0.x + d[7] * xb0.y;
+        tile_dec_s(A1, q, d);
+        a10 += d[0] * xa0.x + d[1] * xa0.y + d[2] * xb0.x + d[3] * xb0.y;
+        a11 += d[4] * xa0.x + d[5] * xa0.y + d[6] * xb0.x + d[7] * xb0.y;
+        sx += (xa1.x + xa1.y) + (xb1.x + xb1.y);
+        tile_dec_s(B0, q, d);
+        a00 += d[0] * xa1.x + d[1] * xa1.y + d[2] * xb1.x + d[3] * xb1.y;
+        a01 += d[4] * xa1.x + d[5] * xa1.y + d[6] * xb1.x + d[7] * xb1.y;
+        tile_dec_s(B1, q, d);
+        a10 += d[0] * xa1.x + d[1] * xa1.y + d[2] * xb1.x + d[3] * xb1.y;
+        a11 += d[4] * xa1.x + d[5] * xa1.y + d[6] * xb1.x + d[7] * xb1.y;
+        A0 = C0; A1 = C1; B0 = D0; B1 = D1;
+        xa0 = na0; xb0 = nb0; xa1 = na1; xb1 = nb1;
+        tile = tn; xb = xn;
+    }
+#elif defined(PIPE2)
+    // S17 software pipeline, distance 2 (kt is even: 160 / 40): k-tiles k+2, k+3 load while k, k+1 decode
+    TWords A0 = tile_load(tile, g), A1 = tile_load(tile + TW * 4u, g);
+    TWords B0 = tile_load(tile + tstride, g), B1 = tile_load(tile + tstride + TW * 4u, g);
+    vec2 xa0 = V2(px).v[0], xb0 = V2(px).v[4], xa1 = V2(px + 64ul).v[0], xb1 = V2(px + 64ul).v[4];
+    for (uint k = 0u; k < pc.kt; k += 2u) {
+        const uint kn = k + 2u < pc.kt ? 2u : 0u;
+        const uint64_t tn = tile + tstride * kn, pn = px + 64ul * kn;
+        const TWords C0 = tile_load(tn, g), C1 = tile_load(tn + TW * 4u, g);
+        const TWords D0 = tile_load(tn + tstride, g), D1 = tile_load(tn + tstride + TW * 4u, g);
+        const vec2 na0 = V2(pn).v[0], nb0 = V2(pn).v[4], na1 = V2(pn + 64ul).v[0], nb1 = V2(pn + 64ul).v[4];
+        float d[8];
+        sx += (xa0.x + xa0.y) + (xb0.x + xb0.y);
+        tile_dec_w(A0, g, d);
+        a00 += d[0] * xa0.x + d[1] * xa0.y + d[2] * xb0.x + d[3] * xb0.y;
+        a01 += d[4] * xa0.x + d[5] * xa0.y + d[6] * xb0.x + d[7] * xb0.y;
+        tile_dec_w(A1, g, d);
+        a10 += d[0] * xa0.x + d[1] * xa0.y + d[2] * xb0.x + d[3] * xb0.y;
+        a11 += d[4] * xa0.x + d[5] * xa0.y + d[6] * xb0.x + d[7] * xb0.y;
+        sx += (xa1.x + xa1.y) + (xb1.x + xb1.y);
+        tile_dec_w(B0, g, d);
+        a00 += d[0] * xa1.x + d[1] * xa1.y + d[2] * xb1.x + d[3] * xb1.y;
+        a01 += d[4] * xa1.x + d[5] * xa1.y + d[6] * xb1.x + d[7] * xb1.y;
+        tile_dec_w(B1, g, d);
+        a10 += d[0] * xa1.x + d[1] * xa1.y + d[2] * xb1.x + d[3] * xb1.y;
+        a11 += d[4] * xa1.x + d[5] * xa1.y + d[6] * xb1.x + d[7] * xb1.y;
+        A0 = C0; A1 = C1; B0 = D0; B1 = D1;
+        xa0 = na0; xb0 = nb0; xa1 = na1; xb1 = nb1;
+        tile = tn; px = pn;
+    }
+#else
+    // S17 software pipeline: k-tile k+1's trellis words and x are loaded before k-tile k is decoded (same arithmetic)
+    TWords w0 = tile_load(tile, g), w1 = tile_load(tile + TW * 4u, g);
+    vec2 xa = V2(px).v[0], xb = V2(px).v[4];
+    for (uint k = 0u; k < pc.kt; ++k) {
+        const uint kn = k + 1u < pc.kt ? 1u : 0u;          // last iteration re-reads the same tile (harmless)
+        const uint64_t tn = tile + tstride * kn;
+        const TWords n0 = tile_load(tn, g), n1 = tile_load(tn + TW * 4u, g);
+        const uint64_t pn = px + 64ul * kn;
+        const vec2 na = V2(pn).v[0], nb = V2(pn).v[4];
+        sx += (xa.x + xa.y) + (xb.x + xb.y);
+        float d[8];
+        tile_dec_w(w0, g, d);
+        a00 += d[0] * xa.x + d[1] * xa.y + d[2] * xb.x + d[3] * xb.y;
+        a01 += d[4] * xa.x + d[5] * xa.y + d[6] * xb.x + d[7] * xb.y;
+        tile_dec_w(w1, g, d);
+        a10 += d[0] * xa.x + d[1] * xa.y + d[2] * xb.x + d[3] * xb.y;
+        a11 += d[4] * xa.x + d[5] * xa.y + d[6] * xb.x + d[7] * xb.y;
+        w0 = n0; w1 = n1; xa = na; xb = nb;
+        tile = tn;
+        px = pn;
+    }
+#endif
+    const float bias = K_BIAS * subgroupAdd(sx) * 0.125;   // every row is loaded by 8 lanes (one per c0)
+    a00 += subgroupShuffleXor(a00, 1u); a01 += subgroupShuffleXor(a01, 1u);
+    a10 += subgroupShuffleXor(a10, 1u); a11 += subgroupShuffleXor(a11, 1u);
+    a00 += subgroupShuffleXor(a00, 2u); a01 += subgroupShuffleXor(a01, 2u);
+    a10 += subgroupShuffleXor(a10, 2u); a11 += subgroupShuffleXor(a11, 2u);
+    if ((t & 3u) == 0u) {
+        const uint c = t >> 2, ob = e * pc.os_e + m * pc.os_m + nt0 * 16u + c;
+        F32 o = F32(pc.out_addr);
+        o.v[ob] = K_INV * a00 + bias;
+        o.v[ob + 8u] = K_INV * a01 + bias;
+        o.v[ob + 16u] = K_INV * a10 + bias;
+        o.v[ob + 24u] = K_INV * a11 + bias;
+    }
+}

@@ -1,0 +1,31 @@
+S10 rand-at-depth chase — 2026-10-27, run by _work/s10-battery.sh (S9 chase protocol:
+100G SLC-honest scratch, 45 s settle, reads only). Verbatim console output.
+Q: does engine-shaped rand close 3.4 -> 4.9 at qd16/32? A: NO — flat above qd4.
+Q: rand at the 1.66 bpw expert size (1020k)? A: measured, ceiling 2796 MB/s.
+Driver health: 0 media errors before and after; 36 C idle -> 63 C under load.
+
+== MemAvailable at battery start ==
+MemTotal:       14815176 kB
+MemAvailable:   10920016 kB
+== nvme smart-log (health) ==
+critical_warning			: 0
+temperature				: 36 °C (309 K, 96 °F)
+media_errors				: 0
+== creating 100G SLC-honest scratch ==
+-rw-r--r-- 1 root root 107374182400 Oct 27 14:32 /var/tmp/ps5probe-scratch/chase10.bin
+== settle 45 s (SLC/dram drain, gate protocol) ==
+seq 1M qd32 libaio            4858 MB/s  iops=    4633  clat_avg_us=6886
+rand 1020k qd1 libaio         2185 MB/s  iops=    2092  clat_avg_us=454
+rand 1020k qd4 libaio         2796 MB/s  iops=    2677  clat_avg_us=1474
+rand 1020k qd8 libaio         2798 MB/s  iops=    2678  clat_avg_us=2966
+rand 1020k qd16 libaio        2796 MB/s  iops=    2677  clat_avg_us=5954
+rand 1020k qd32 libaio        2795 MB/s  iops=    2676  clat_avg_us=11937
+rand 2.6M qd16 libaio         3299 MB/s  iops=    1239  clat_avg_us=12859
+rand 2.6M qd32 libaio         3298 MB/s  iops=    1239  clat_avg_us=25770
+rand 3M qd32 libaio           3503 MB/s  iops=    1114  clat_avg_us=28656
+seq 1M qd32 libaio (2)        4855 MB/s  iops=    4630  clat_avg_us=6889
+== post-bench health ==
+critical_warning			: 0
+temperature				: 63 °C (336 K, 145 °F)
+media_errors				: 0
+s10 chase done

@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Run artifacts — everything under logs/ and *.out is session output, not source
+logs/
+*.out
+*.log
+
+# Raw capture binaries live on external storage (SHA256SUMS + TSVs stay in git)
+captures/**/*.bin
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# Local scratch
+*.tmp
+*.bak
+
+# Capture binaries anywhere (the archive keeps SHA256SUMS + TSVs)
+**/captures/**/*.bin
+
+# Local console settings and build trees
+scripts/console.env
+
+# SSH keys never go in git (removed from history for the public release)
+.ssh/
+/build/
+
+# model files and study scratch never go in git
+model/
+ps5lm_s15/
+traces/

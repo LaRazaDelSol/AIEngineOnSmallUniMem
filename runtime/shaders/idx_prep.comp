@@ -1,0 +1,53 @@
+#version 460
+// S19 QSA indexer, per token (Qwen4ExpTextQSAIndexer): iqk = index_qk_proj(x) = [q: 4 heads x 128 | raw key: 128].
+// WG 0..3: q head h -> RMSNorm (1 + w) over 128 -> RoPE on the first 64 dims at the token position (rotate_half within
+// 64, inv_freq = theta^(-2i/64): the attention's partial rotary) -> qi[h]. WG 4: the RAW key (no norm, no RoPE: it is
+// pooled per 4-token block first) -> rk[pos] (fp16, per-position like the KV cache, so restores / rejected drafts are
+// consistent).
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#ifndef RKR
+#define RKR 1024u   // S30: rk ring positions (flash_engine.hpp kRkRing)
+#endif
+layout(local_size_x = 128) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer H16 { float16_t v[]; };
+layout(push_constant) uniform PC { uint64_t iqk; uint64_t qnw; uint64_t qi; uint64_t rk; uint64_t params; float eps; float theta;
+#ifdef WIDE   // S21: grid (5, T), token t at iqk + t*is, qi + t*qis, position pos0 + t
+    uint is_; uint qis; uint pos0; uint pad;
+#endif
+} pc;
+shared float red[2];
+shared float vals[128];
+void main() {
+    const uint hd = gl_WorkGroupID.x, i = gl_LocalInvocationID.x;
+#ifdef WIDE
+    const uint tw = gl_WorkGroupID.y;
+    const uint pos = pc.pos0 + tw;
+    const uint64_t iqk = pc.iqk + uint64_t(tw) * uint64_t(pc.is_), qi = pc.qi + uint64_t(tw) * uint64_t(pc.qis);
+#else
+    const uint pos = U32(pc.params).v[0];
+    const uint64_t iqk = pc.iqk, qi = pc.qi;
+#endif
+    float x = F32(iqk).v[hd * 128u + i];
+    if (hd == 4u) { H16(pc.rk).v[(pos & (RKR - 1u)) * 128u + i] = float16_t(x); return; }
+    const float s = subgroupAdd(x * x);
+    if (gl_SubgroupInvocationID == 0u) red[gl_SubgroupID] = s;
+    barrier();
+    float tot = 0.0;
+    for (uint t = 0u; t < gl_NumSubgroups; ++t) tot += red[t];
+    x = x * inversesqrt(tot / 128.0 + pc.eps) * (1.0 + F32(pc.qnw).v[i]);
+    vals[i] = x;
+    barrier();
+    if (i < 64u) {
+        const uint f = i & 31u;
+        const float ang = float(pos) * pow(pc.theta, -float(2u * f) / 64.0);
+        const float c = cos(ang), sn = sin(ang);
+        x = i < 32u ? x * c - vals[i + 32u] * sn : x * c + vals[i - 32u] * sn;
+    }
+    F32(qi).v[hd * 128u + i] = x;
+}

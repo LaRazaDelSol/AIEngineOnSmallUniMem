@@ -1,0 +1,14 @@
+#version 460
+// Streaming read-bandwidth probe / dense-layer stand-in: XOR-reduce n uvec4 words.
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer UV4 { uvec4 v[]; };
+layout(push_constant) uniform PC { uint64_t src; uint64_t outp; uint n; uint magic; } pc;
+void main() {
+    UV4 S = UV4(pc.src);
+    uvec4 a = uvec4(0);
+    const uint stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += stride) a ^= S.v[i];
+    uint t = a.x ^ a.y ^ a.z ^ a.w;
+    if (t == pc.magic) F32(pc.outp).v[0] = float(t);  // practically never true; defeats DCE
+}

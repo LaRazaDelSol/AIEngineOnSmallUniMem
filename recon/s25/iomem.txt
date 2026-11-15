@@ -1,0 +1,66 @@
+00000000-00000fff : Reserved
+00001000-0006ffff : System RAM
+00070000-000fffff : Reserved
+  000c0000-000c7fff : Video ROM
+  000f0000-000fffff : System ROM
+00100000-00ffffff : System RAM
+01000000-3fffffff : Reserved
+40000000-5fffffff : System RAM
+60000000-60bfffff : Reserved
+60c00000-627fffff : System RAM
+62800000-64828fff : Reserved
+64829000-7f9cffff : System RAM
+7f9d0000-7fd66fff : Reserved
+7fd67000-7fd6efff : ACPI Non-volatile Storage
+7fd6f000-7fd8efff : ACPI Tables
+7fd8f000-c43fffff : Reserved
+  80000000-c43fffff : PCI Bus 0000:40
+    84800000-848fffff : 0000:40:00.7
+      84800000-848fffff : NXP mdriver PCIe
+    84900000-8491ffff : 0000:40:00.7
+      84900000-8491ffff : NXP mdriver PCIe
+    84920000-84923fff : 0000:40:00.7
+    85000000-85000fff : 0000:40:00.2
+      85000000-85000fff : mts
+    85004000-85007fff : 0000:40:00.3
+    85008000-8500bfff : 0000:40:00.4
+      85008000-8500bfff : ahci_salina_drv
+    8500c000-8500cfff : 0000:40:00.5
+    85200000-853fffff : 0000:40:00.5
+    85400000-8547ffff : 0000:40:00.5
+    85600000-857fffff : 0000:40:00.6
+      85600000-857fffff : xhci-hcd
+    88000000-88003fff : 0000:40:02.5
+      88000000-88003fff : nvme
+    a0000000-bfffffff : 0000:40:00.1
+    c0000000-c3ffffff : 0000:40:00.1
+    c4000000-c41fffff : 0000:40:00.0
+    c4200000-c4203fff : 0000:40:00.0
+    c4300000-c43fffff : 0000:40:00.0
+d0000000-e06fffff : Reserved
+  d0000000-e06fffff : PCI Bus 0000:20
+    d0000000-dfffffff : 0000:20:00.0
+    e0000000-e01fffff : 0000:20:00.0
+    e0200000-e02fffff : 0000:20:00.4
+      e0200000-e02fffff : xhci-hcd
+    e0300000-e03fffff : 0000:20:00.5
+      e0300000-e03fffff : xhci-hcd
+    e0400000-e04fffff : 0000:20:00.3
+    e0500000-e05fffff : 0000:20:00.2
+    e0600000-e067ffff : 0000:20:00.0
+    e0680000-e06bffff : 0000:20:00.6
+    e06c0000-e06c3fff : 0000:20:00.1
+    e06c4000-e06c5fff : 0000:20:00.3
+    e06c6000-e06c7fff : 0000:20:00.2
+f0000000-f7ffffff : PCI ECAM 0000 [bus 00-7f]
+  f0000000-f7ffffff : Reserved
+fdd80000-fddfffff : amd_iommu
+100000000-44fffffff : System RAM
+  163800000-164b4ee5f : Kernel code
+  164c00000-165792fff : Kernel rodata
+  165800000-165bd0cff : Kernel data
+  165eaf000-165ff3fff : Kernel bss
+450000000-46fffffff : Reserved
+470000000-47f2fffff : System RAM
+47f300000-47fffffff : Reserved
+980000000-99fffffff : PCI Bus 0000:40

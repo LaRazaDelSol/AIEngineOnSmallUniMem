@@ -1,0 +1,65 @@
+#version 460
+// S18 stage C: matvec_xr.comp for NB token columns of a verify batch. The weight words are loaded ONCE per row and
+// consumed by every column; each column keeps matvec_xr.comp's exact arithmetic (same per-lane order, same subgroupAdd),
+// so every column's output is bit-identical to a single-token dispatch. Column c: x at x + c*xs, y at y + c*ys (bytes).
+// y[r] (+)= act(alpha * W[r] . x).  mode: 0 store, 1 accumulate, 2 silu, 3 sigmoid.
+#define BITS 4
+#include "common.glsl"
+#ifndef KDIM
+#define KDIM 2560
+#endif
+#ifndef NB
+#define NB 2
+#endif
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint64_t w; uint64_t x; uint64_t y; uint K; uint N; uint rpw; uint mode; float alpha; uint xs; uint ys; uint nb; } pc;
+const uint QW = (KDIM / 32u) * QWPB;
+const uint ITERS = (QW + 63u) / 64u;
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint SW = scale_words(KDIM), RW = row_words(KDIM);
+    U32 W = U32(pc.w);
+    float xv[NB][ITERS][8];
+    float sx[NB][ITERS];
+    [[unroll]] for (uint c = 0u; c < NB; ++c) {
+        V4 X = V4(pc.x + uint64_t(c) * uint64_t(pc.xs));
+        [[unroll]] for (uint it = 0u; it < ITERS; ++it) {
+            const uint w = lane + 64u * it;
+            float t[16];
+            float s0;
+            if (w < QW) load_x(X, w, t, s0); else { s0 = 0.0; [[unroll]] for (uint v = 0u; v < 16u; ++v) t[v] = 0.0; }
+            sx[c][it] = s0;
+            [[unroll]] for (uint v = 0u; v < 8u; ++v) xv[c][it][v] = t[v];
+        }
+    }
+    const uint r0 = gl_WorkGroupID.x * pc.rpw;
+    for (uint rr = 0u; rr < pc.rpw; ++rr) {
+        const uint r = r0 + rr;
+        if (r >= pc.N) break;
+        const uint rb = r * RW;
+        float acc[NB];
+        [[unroll]] for (uint c = 0u; c < NB; ++c) acc[c] = 0.0;
+        [[unroll]] for (uint it = 0u; it < ITERS; ++it) {
+            const uint w = lane + 64u * it;
+            if (w < QW) {
+                const uint q = W.v[rb + SW + w];
+                const float bs = block_scale(W, rb, w);
+                [[unroll]] for (uint c = 0u; c < NB; ++c) {
+                    float s = 0.0;
+                    [[unroll]] for (uint v = 0u; v < 8u; ++v) s += qval(q, v) * xv[c][it][v];
+                    acc[c] += bs * (s - ZERO * sx[c][it]);
+                }
+            }
+        }
+        [[unroll]] for (uint c = 0u; c < NB; ++c) {
+            const float a = subgroupAdd(acc[c]) * pc.alpha;
+            if (lane == 0u) {
+                F32 Y = F32(pc.y + uint64_t(c) * uint64_t(pc.ys));
+                float o = a;
+                if (pc.mode == 2u) o = a / (1.0 + exp(-a));
+                else if (pc.mode == 3u) o = 1.0 / (1.0 + exp(-a));
+                if (pc.mode == 1u) Y.v[r] += o; else Y.v[r] = o;
+            }
+        }
+    }
+}

@@ -1,0 +1,140 @@
+#version 460
+// Flash-decoding attention, pass 1 (S14). Replaces attn.comp, whose cost grew ~linearly with context on one
+// WG per query head (82 us/layer at ctx 76 -> 986 us at ctx 757, x12 attention layers).
+// Grid (max_ctx / 64 chunks, 2 kv heads), 256 threads. A WG owns 64 positions of ONE kv head and computes all
+// 12 query heads of its GQA group against them, so each K/V row is read once per chunk:
+//   scores[j][p] = q[kvh*12+j] . K[t] / 16       (4 threads per position, 64 dims each, clustered reduce)
+//   m_j = max_p, l_j = sum_p exp(s - m_j), o_j = sum_p exp(s - m_j) V[t]
+// writes part[h][chunk] = {m, l, o[256]} (258 floats). attn_combine.comp merges the chunks.
+// S19: -DKV16 = fp16 K/V cache; -DSEL = the QSA indexer's token list (sel[0] = count, 0 = dense 0..pos; entries
+// sel[1..count] are positions): chunk c covers LIST entries [64c, 64c+64).
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_clustered : require
+#ifdef KV16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer KH4 { f16vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer H16 { float16_t v[]; };
+#endif
+#ifdef KVQ   // S20 quantized KV rows (attn_prep.comp): K int8 68 words, V int8 68 / int4 36 words, scale in the tail
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer R32 { uint v[]; };
+shared float vsc[64];
+#endif
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t q; uint64_t kcache; uint64_t vcache; uint64_t part; uint64_t params; uint max_chunks; uint pad; uint64_t sel; } pc;
+const uint CH = 64u, G = 12u, D = 256u, PS = 258u;
+shared vec4 qs[G][D / 4u];
+shared float sc[G][CH];
+shared float ml[G][2];
+shared uint pmap[CH];
+void main() {
+    const uint chunk = gl_WorkGroupID.x, kvh = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+#ifdef SEL
+    const uint ns = U32(pc.sel).v[0];
+    const uint n = ns != 0u ? ns : U32(pc.params).v[0] + 1u;  // list entries, or positions 0..pos
+#else
+    const uint n = U32(pc.params).v[0] + 1u;  // positions 0..pos
+#endif
+    const uint t0 = chunk * CH;
+    if (t0 >= n) return;
+    V4 Q = V4(pc.q);
+#if defined(KVQ)
+    R32 Kq = R32(pc.kcache), Vq = R32(pc.vcache);
+#elif defined(KV16)
+    KH4 Kc = KH4(pc.kcache);
+    H16 Vc = H16(pc.vcache);
+#else
+    V4 Kc = V4(pc.kcache);
+    F32 Vc = F32(pc.vcache);
+#endif
+    F32 P = F32(pc.part);
+    for (uint i = tid; i < G * (D / 4u); i += 256u) qs[i / (D / 4u)][i % (D / 4u)] = Q.v[(kvh * G) * (D / 4u) + i];
+    if (tid < CH) {
+#ifdef SEL
+        pmap[tid] = ns != 0u ? (t0 + tid < n ? U32(pc.sel).v[1u + t0 + tid] : 0u) : t0 + tid;
+#else
+        pmap[tid] = t0 + tid;
+#endif
+    }
+#ifdef KVQ
+#if KVQ == 4
+    if (tid < CH) vsc[tid] = t0 + tid < n ? uintBitsToFloat(Vq.v[(pmap[tid] * 2u + kvh) * 36u + 32u]) : 0.0;
+#elif KVQ == 2
+    if (tid < CH) vsc[tid] = t0 + tid < n ? uintBitsToFloat(Vq.v[(pmap[tid] * 2u + kvh) * 33u + 32u]) : 0.0;
+#else
+    if (tid < CH) vsc[tid] = t0 + tid < n ? uintBitsToFloat(Vq.v[(pmap[tid] * 2u + kvh) * 68u + 64u]) : 0.0;
+#endif
+#endif
+    barrier();
+    // ---- scores: thread = (position p = tid / 4, quarter qd = tid % 4 -> dims [qd*64, qd*64+64)) ----
+    const uint p = tid >> 2, qd = tid & 3u, t = t0 + p;
+    float acc[G];
+    [[unroll]] for (uint j = 0u; j < G; ++j) acc[j] = 0.0;
+    if (t < n) {
+#if defined(KVQ) && KVQ == 2   // k4v4: rotated 4-bit K (attn_prep.comp put4); the query is rotated too
+        const uint kr = (pmap[p] * 2u + kvh) * 33u;
+        for (uint e = 0u; e < 8u; ++e) {
+            const uint w = Kq.v[kr + qd * 8u + e];
+            const vec4 k0 = vec4(float(w & 15u), float((w >> 4) & 15u), float((w >> 8) & 15u), float((w >> 12) & 15u)) - 7.5;
+            const vec4 k1 = vec4(float((w >> 16) & 15u), float((w >> 20) & 15u), float((w >> 24) & 15u), float(w >> 28)) - 7.5;
+            [[unroll]] for (uint j = 0u; j < G; ++j) acc[j] += dot(qs[j][qd * 16u + 2u * e], k0) + dot(qs[j][qd * 16u + 2u * e + 1u], k1);
+        }
+        const float ks = uintBitsToFloat(Kq.v[kr + 32u]);
+        [[unroll]] for (uint j = 0u; j < G; ++j) acc[j] *= ks;
+#elif defined(KVQ)
+        const uint kr = (pmap[p] * 2u + kvh) * 68u;
+        for (uint e = 0u; e < 16u; ++e) {
+            const uint w = Kq.v[kr + qd * 16u + e];
+            const vec4 k = vec4(float(int(w << 24) >> 24), float(int(w << 16) >> 24), float(int(w << 8) >> 24), float(int(w) >> 24));
+            [[unroll]] for (uint j = 0u; j < G; ++j) acc[j] += dot(qs[j][qd * 16u + e], k);
+        }
+        const float ks = uintBitsToFloat(Kq.v[kr + 64u]);
+        [[unroll]] for (uint j = 0u; j < G; ++j) acc[j] *= ks;
+#else
+        const uint kb = ((pmap[p] * 2u + kvh) * D) / 4u + qd * 16u;
+        for (uint e = 0u; e < 16u; ++e) {
+            const vec4 k = vec4(Kc.v[kb + e]);
+            [[unroll]] for (uint j = 0u; j < G; ++j) acc[j] += dot(qs[j][qd * 16u + e], k);
+        }
+#endif
+    }
+    [[unroll]] for (uint j = 0u; j < G; ++j) {
+        const float s = subgroupClusteredAdd(acc[j], 4u);
+        if (qd == 0u) sc[j][p] = t < n ? s * 0.0625 : -1e30;
+    }
+    barrier();
+    // ---- per-head chunk softmax stats: wave w handles heads w, w+4, w+8 (lane = position) ----
+    const uint lane = gl_SubgroupInvocationID, wave = gl_SubgroupID;
+    for (uint j = wave; j < G; j += gl_NumSubgroups) {
+        const float v = sc[j][lane];
+        const float m = subgroupMax(v);
+        const float e = (t0 + lane < n) ? exp(v - m) : 0.0;
+        const float l = subgroupAdd(e);
+        sc[j][lane] = e;
+        if (lane == 0u) { ml[j][0] = m; ml[j][1] = l; }
+    }
+    barrier();
+    // ---- PV: thread = output dim d, 12 accumulators ----
+    const uint d = tid, np = min(CH, n - t0);
+    float o[G];
+    [[unroll]] for (uint j = 0u; j < G; ++j) o[j] = 0.0;
+    for (uint q2 = 0u; q2 < np; ++q2) {
+#if defined(KVQ) && KVQ == 2
+        const uint w = Vq.v[(pmap[q2] * 2u + kvh) * 33u + (d >> 3)];
+        const float v = (float((w >> ((d & 7u) * 4u)) & 15u) - 7.5) * vsc[q2];
+#elif defined(KVQ) && KVQ == 4
+        const uint w = Vq.v[(pmap[q2] * 2u + kvh) * 36u + (d >> 3)];
+        const float v = (float((w >> ((d & 7u) * 4u)) & 15u) - 8.0) * vsc[q2];
+#elif defined(KVQ)
+        const uint w = Vq.v[(pmap[q2] * 2u + kvh) * 68u + (d >> 2)];
+        const float v = float(int(w << (24u - (d & 3u) * 8u)) >> 24) * vsc[q2];
+#else
+        const float v = float(Vc.v[(pmap[q2] * 2u + kvh) * D + d]);
+#endif
+        [[unroll]] for (uint j = 0u; j < G; ++j) o[j] += sc[j][q2] * v;
+    }
+    [[unroll]] for (uint j = 0u; j < G; ++j) {
+        const uint base = ((kvh * G + j) * pc.max_chunks + chunk) * PS;
+        P.v[base + 2u + d] = o[j];
+        if (d == 0u) { P.v[base] = ml[j][0]; P.v[base + 1u] = ml[j][1]; }
+    }
+}

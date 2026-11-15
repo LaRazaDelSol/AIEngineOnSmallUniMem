@@ -1,0 +1,44 @@
+# S9 "2625 chase" — 2026-10-27, root, PS5 console 10.0.0.113 (ChimeraOS track, kernel 7.2.3)
+# Script: _work/s9-chase.sh (fio 3.42; 100 GiB SLC-honest scratch, 45 s settle; raw-device READ-ONLY)
+# Context: gate G1 seq was 2625 MB/s (S8) — that run was psync qd1-capped because the
+# engine probe used an invalid option (`fio --engines=libaio`); W11 #3. This chase
+# re-measures with working async engines. Raw output:
+
+== nvme smart-log (health) ==
+critical_warning			: 0
+temperature				: 50 °C (323 K, 122 °F)
+media_errors				: 0
+num_err_log_entries			: 0
+== HMB (feature 0x0d) ==
+get-feature:0x0d (Host Memory Buffer), Current value:0x00000001
+       0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
+0000: 00 40 00 00 00 f0 c1 13 01 00 00 00 10 00 00 00 ".@.............."
+== creating 100G SLC-honest scratch ==
+-rw-r--r-- 1 root root 107374182400 Oct 27 13:27 /var/tmp/ps5probe-scratch/chase.bin
+== settle 45 s (SLC/dram drain, gate protocol) ==
+seq 1M qd32 libaio              4919 MB/s  iops=    4691  clat_avg_us=6799
+seq 1M qd32 io_uring            4922 MB/s  iops=    4694  clat_avg_us=6794
+seq 1M qd8  libaio              4927 MB/s  iops=    4699  clat_avg_us=1680
+seq 1M qd1  libaio              2520 MB/s  iops=    2404  clat_avg_us=396
+rand 2.6M qd8 libaio            3351 MB/s  iops=    1259  clat_avg_us=6301
+rand 3M qd8 libaio              3569 MB/s  iops=    1134  clat_avg_us=6990
+rand 4k qd64 libaio             1252 MB/s  iops=  305705  clat_avg_us=207
+== raw device (READ-ONLY, bypasses fs) ==
+raw seq 1M qd32 libaio          4069 MB/s  iops=    3881  clat_avg_us=8222
+raw seq 1M qd32 io_uring        4077 MB/s  iops=    3888  clat_avg_us=8190
+== post-bench health ==
+critical_warning			: 0
+media_errors				: 0
+chase done
+
+# Readings:
+# - qd1 seq = 2520 reproduces S8's citable 2625: the old number was the qd1 CEILING, not the drive.
+# - Depth >=8 saturates: ~4.92 GB/s regardless of engine (libaio == io_uring) or qd8 vs qd32.
+# - Engine-shaped rand 2.6-3M qd8 = 3351-3569 (SLC-honest). NOTE: today's sweep G1 rand (4813)
+#   ran on a 1 GiB scratch (S8-sweep-comparable) and is SLC-inflated — the 100G numbers here are
+#   the honest engine-shaped term. Untested: rand at qd16/32 (does depth close rand toward seq?).
+# - rand 4k qd64 = 1252 MB/s (305k IOPS) vs S8's 49 MB/s — also a qd1 artifact (25x).
+# - Raw device reads LOWER than fs (4069-4077): spans PS5-OS regions; fs-level is engine-relevant.
+# - HMB active (64 MiB, feature 0x0d enabled); drive healthy before and after (0 media errors).
+# Gate verdict ladder (probe.py:536): >=5000 GO:100B+ | >=3000 PIVOT:35B-A3B | <3000 NO-GO
+# → 4919-4927 lands in PIVOT, 3% under the 100B bar; async IO has no more headroom to close it.

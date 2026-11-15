@@ -1,0 +1,56 @@
+#version 460
+// S17 hyper-connection pre-step (hc_mode 3), part 2: T[r] = silu(alpha * W_down[r] . N) for r < 320 and
+// Il[r-320] = W_inj[r-320] . N for the n_inj injection rows, with N = RMSNorm_per_stream(H) * (1 + w) NEVER
+// materialised: wave c of the row's workgroup dots stream c's quarter of the row with H * (1 + w) and scales the
+// partial by that stream's 1/rms (from hc_sumsq's partials) at the end. 4 waves per row -> 1,296 waves instead of
+// 320 one-wave rows of the 3-kernel path. Same math; reassociated rounding (validated by the residual-stream dump).
+#define BITS 4
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t w; uint64_t winj; uint64_t x; uint64_t nw; uint64_t psum; uint64_t t; uint64_t il;
+    float alpha; float eps; uint n_inj; uint pad;
+} pc;
+const uint H = 2560u, KF = 10240u, NROW = 320u;
+shared float sh[4];
+void main() {
+    const uint lane = gl_SubgroupInvocationID, c = gl_SubgroupID, r = gl_WorkGroupID.x;
+    const bool inj = r >= NROW;
+    const uint SW = scale_words(KF), RW = row_words(KF);
+    U32 W = U32(inj ? pc.winj : pc.w);
+    const uint rb = (inj ? r - NROW : r) * RW;
+    V4 X = V4(pc.x), NW = V4(pc.nw);
+    float acc = 0.0;
+    [[unroll]] for (uint it = 0u; it < 5u; ++it) {         // stream c = quant words [320c, 320c + 320)
+        const uint w = c * 320u + lane + 64u * it;
+        float xv[8];
+        float sx = 0.0;
+        [[unroll]] for (uint g = 0u; g < 2u; ++g) {
+            const uint ei = elem_of(w, 4u * g) >> 2;
+            const vec4 hv = X.v[ei], wv = NW.v[ei];
+            const vec4 v = hv * (vec4(1.0) + wv);
+            xv[4u * g + 0u] = v.x; xv[4u * g + 1u] = v.y; xv[4u * g + 2u] = v.z; xv[4u * g + 3u] = v.w;
+            sx += v.x + v.y + v.z + v.w;
+        }
+        const uint q = W.v[rb + SW + w];
+        float s = 0.0;
+        [[unroll]] for (uint v = 0u; v < 8u; ++v) s += qval(q, v) * xv[v];
+        acc += block_scale(W, rb, w) * (s - ZERO * sx);
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0u) {
+        F32 P = F32(pc.psum);
+        float ss = 0.0;
+        for (uint k = 0u; k < 10u; ++k) ss += P.v[c * 10u + k];
+        sh[c] = acc * inversesqrt(ss / float(H) + pc.eps);
+    }
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        const float tot = sh[0] + sh[1] + sh[2] + sh[3];
+        if (inj) F32(pc.il).v[r - NROW] = tot;
+        else {
+            const float a = tot * pc.alpha;
+            F32(pc.t).v[r] = a / (1.0 + exp(-a));
+        }
+    }
+}

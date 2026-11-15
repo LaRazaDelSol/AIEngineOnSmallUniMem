@@ -1,0 +1,97 @@
+#version 460
+// S30 QSA indexer block scores for decode / verify, spread over the whole GPU. idx_select.comp scored every block of a
+// query inside ONE workgroup (one CU of 40): at 190k positions that is 47.5k pooled keys (24 MB) read through one CU
+// with lane-strided 512 B rows, +0.144 ms per 1k positions per generated token in served use. Here a fixed grid of
+// workgroups walks the blocks in chunks of 64: the chunk's keys go to LDS once (coalesced) and wave c scores verify
+// columns c and c + 4, so a verify of T <= 8 tokens reads each key once instead of T times. The per-block arithmetic is idx_select's
+// (same loop order, same sums), the scores land in each column's global scratch, and idx_select_ps then runs the
+// unchanged exact bisection + ordered compaction on them.
+// Columns: t < T, column t's activations at +t * S (qi, params, scratch); column 0's position gives the batch's first
+// block completed inside the batch (bnew): those blocks are pooled here from the raw keys exactly as idx_select pools
+// them (it still publishes pk[b]), earlier ones are read from pk. A column with <= 512 complete blocks is dense: skipped.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#ifndef RKR
+#define RKR 1024u   // S30: rk ring positions (flash_engine.hpp kRkRing)
+#endif
+layout(local_size_x = 256) in;
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer V4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer F32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer H16 { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer PK4 { f16vec4 v[]; };  // pooled keys fp16
+layout(push_constant) uniform PC { uint64_t qi0; uint64_t pk; uint64_t rk; uint64_t knw; uint64_t par0; uint64_t scr0;
+                                   uint S; uint T; uint nwg; float eps; float theta; uint pad; } pc;
+const uint TOPB = 512u, CH = 64u;
+shared vec4 kk[CH][33];          // the chunk's keys, rows padded to 33 vec4 (lane-per-block reads stay off one bank)
+shared vec4 qs[8][4][32];        // [column][head][dim / 4]
+void main() {
+    const uint tid = gl_LocalInvocationID.x, lane = gl_SubgroupInvocationID, wave = gl_SubgroupID;
+    const uint T = min(pc.T, 8u);
+    const uint pos0 = U32(pc.par0).v[0];
+    const uint bnew = pos0 / 4u;                       // blocks >= bnew complete inside this batch
+    const uint nbmax = (pos0 + T) / 4u;                // the last column's complete blocks
+    if (nbmax <= TOPB) return;                         // every column is dense
+    uint nbc[2] = {0u, 0u};                            // this wave's columns wave, wave + 4: complete blocks (0 = none / dense)
+    [[unroll]] for (uint k = 0u; k < 2u; ++k) {
+        const uint c = wave + 4u * k;
+        if (c < T) {
+            const uint p = U32(pc.par0 + uint64_t(c) * uint64_t(pc.S)).v[0];
+            nbc[k] = (p + 1u) / 4u;
+            if (nbc[k] <= TOPB) nbc[k] = 0u;
+        }
+    }
+    for (uint i = tid; i < T * 128u; i += 256u) {
+        const uint c = i >> 7, r = i & 127u;
+        qs[c][r >> 5][r & 31u] = V4(pc.qi0 + uint64_t(c) * uint64_t(pc.S)).v[r];
+    }
+    PK4 P4 = PK4(pc.pk);
+    for (uint ch = gl_WorkGroupID.x; ch * CH < nbmax; ch += pc.nwg) {
+        const uint b0 = ch * CH;
+        barrier();                                     // the previous chunk's keys are no longer read
+        for (uint i = tid; i < CH * 32u; i += 256u) {
+            const uint r = i >> 5, j = i & 31u, b = b0 + r;
+            if (b < bnew && b < nbmax) kk[r][j] = vec4(P4.v[b * 32u + j]);
+        }
+        // blocks completed inside the batch (<= 2): idx_select.comp's pooling, wave w < 2 -> block bnew + w
+        if (wave < 2u) {
+            const uint b = bnew + wave;
+            if (b < nbmax && b >= b0 && b < b0 + CH) {
+                H16 R = H16(pc.rk);
+                float a0 = 0.0, a1 = 0.0;
+                for (uint j = 0u; j < 4u; ++j) { const uint rr = ((4u * b + j) & (RKR - 1u)) * 128u; a0 += float(R.v[rr + lane]); a1 += float(R.v[rr + lane + 64u]); }
+                a0 *= 0.25; a1 *= 0.25;
+                const float ss = subgroupAdd(a0 * a0 + a1 * a1);
+                const float inv = inversesqrt(ss / 128.0 + pc.eps);
+                a0 = a0 * inv * (1.0 + F32(pc.knw).v[lane]);
+                a1 = a1 * inv * (1.0 + F32(pc.knw).v[lane + 64u]);
+                const float partner = subgroupShuffleXor(a0, 32u);
+                const uint f = lane & 31u;
+                const float ang = float(4u * b) * pow(pc.theta, -float(2u * f) / 64.0);
+                const float c = cos(ang), sn = sin(ang);
+                a0 = lane < 32u ? a0 * c - partner * sn : a0 * c + partner * sn;
+                a0 = float(float16_t(a0)); a1 = float(float16_t(a1));   // pk's bits
+                kk[b - b0][lane >> 2][lane & 3u] = a0;
+                kk[b - b0][(lane + 64u) >> 2][lane & 3u] = a1;
+            }
+        }
+        barrier();
+        const uint b = b0 + lane;
+        for (uint k = 0u; k < 2u; ++k) {
+            if (b >= nbc[k]) continue;
+            const uint c = wave + 4u * k;
+            float acc[4] = {0.0, 0.0, 0.0, 0.0};
+            for (uint j = 0u; j < 32u; ++j) {
+                const vec4 kv = kk[lane][j];
+                [[unroll]] for (uint h = 0u; h < 4u; ++h) acc[h] += dot(qs[c][h][j], kv);
+            }
+            const float s = (max(acc[0], 0.0) + max(acc[1], 0.0) + max(acc[2], 0.0) + max(acc[3], 0.0)) * 0.08838834764831845;
+            U32(pc.scr0 + uint64_t(c) * uint64_t(pc.S)).v[b] = floatBitsToUint(s);
+        }
+    }
+}

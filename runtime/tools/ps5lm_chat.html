@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PS5 Flash-Next</title>
+<style>
+:root {
+  --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #e3e1dc;
+  --accent: #2f5bd3; --accent-ink: #ffffff; --user: #eef2fb; --think: #f2f0ea; --code: #f3f3f5; --good: #1f8a4c; --warn: #b26a00;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121214; --panel: #1b1b1f; --ink: #ececf0; --muted: #9a9aa3; --line: #2c2c33;
+    --accent: #7b9cff; --accent-ink: #0d0f17; --user: #1f2433; --think: #202024; --code: #24242a; --good: #4cc27e; --warn: #e0a440;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; display: flex; flex-direction: column; }
+header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; margin-right: 6px; }
+.dot.ok { background: var(--good); } .dot.busy { background: var(--warn); }
+.stats { margin-left: auto; display: flex; gap: 14px; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; flex-wrap: wrap; }
+.stats b { color: var(--ink); font-weight: 600; }
+main { flex: 1; overflow-y: auto; padding: 18px 16px 8px; }
+.wrap { max-width: 860px; margin: 0 auto; }
+.msg { margin: 0 0 18px; }
+.msg .who { font-size: 12px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .6px; }
+.msg.user .body { background: var(--user); border-radius: 12px; padding: 10px 14px; white-space: pre-wrap; }
+.msg.bot .body { padding: 2px 2px; }
+.body p { margin: 0 0 10px; }
+.body pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; font: 13px/1.45 ui-monospace, "Cascadia Code", Consolas, monospace; }
+.body code { background: var(--code); border-radius: 4px; padding: 1px 4px; font: 13px ui-monospace, Consolas, monospace; }
+.body pre code { background: none; padding: 0; }
+details.think { background: var(--think); border-radius: 8px; padding: 6px 12px; margin-bottom: 8px; color: var(--muted); font-size: 13.5px; }
+details.think summary { cursor: pointer; }
+details.think div { white-space: pre-wrap; margin-top: 6px; }
+.meta { font-size: 12px; color: var(--muted); margin-top: 6px; font-variant-numeric: tabular-nums; }
+.cursor::after { content: "▍"; animation: blink 1s steps(1) infinite; color: var(--accent); }
+@keyframes blink { 50% { opacity: 0; } }
+footer { border-top: 1px solid var(--line); background: var(--panel); padding: 10px 16px 14px; }
+.row { max-width: 860px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+textarea { flex: 1; resize: none; min-height: 46px; max-height: 220px; padding: 11px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: inherit; }
+textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+button { border: 0; border-radius: 10px; padding: 0 18px; height: 46px; font: inherit; font-weight: 600; cursor: pointer; background: var(--accent); color: var(--accent-ink); }
+button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); font-weight: 500; }
+button:disabled { opacity: .5; cursor: default; }
+.opts { max-width: 860px; margin: 8px auto 0; display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted); font-size: 13px; align-items: center; }
+.opts label { display: flex; gap: 6px; align-items: center; }
+.opts input[type=range] { width: 110px; }
+.opts input[type=number] { width: 72px; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; }
+.empty { text-align: center; color: var(--muted); margin-top: 12vh; }
+.empty h2 { color: var(--ink); font-weight: 600; margin-bottom: 6px; }
+.chips { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-top: 16px; }
+.chip { border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 6px 12px; cursor: pointer; color: var(--ink); font-size: 13.5px; }
+@media (max-width: 600px) { .stats { margin-left: 0; width: 100%; } }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="dot" id="dot"></span>Qwen3.8-Flash-Next on PS5</h1>
+  <div class="stats">
+    <span>last <b id="s-tps">–</b> tok/s</span>
+    <span>hit <b id="s-hit">–</b></span>
+    <span>GPU <b id="s-gpu">–</b> ms</span>
+    <span>I/O <b id="s-io">–</b> ms</span>
+    <span>session avg <b id="s-avg">–</b> tok/s</span>
+  </div>
+</header>
+<main id="main"><div class="wrap" id="log">
+  <div class="empty" id="empty">
+    <h2>125B-parameter MoE, streaming from an SSD into a PS5.</h2>
+    <div>EXL3 experts, Vulkan on RDNA 2, one command buffer per token. Ask it anything.</div>
+    <div class="chips">
+      <span class="chip">Explain how you can run on a PS5 in three sentences.</span>
+      <span class="chip">Write a haiku about memory bandwidth.</span>
+      <span class="chip">Write a Python function that solves Sudoku, with comments.</span>
+      <span class="chip">Give me a weird but true fact about octopuses.</span>
+    </div>
+  </div>
+</div></main>
+<footer>
+  <div class="row">
+    <textarea id="in" rows="1" placeholder="Message the PS5…  (Enter to send, Shift+Enter for a newline)"></textarea>
+    <button id="send">Send</button>
+    <button id="stop" class="ghost" style="display:none">Stop</button>
+  </div>
+  <div class="opts">
+    <label>thinking <select id="effort"><option value="auto">auto</option><option value="none">off</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select></label>
+    <label>temperature <input type="range" id="temp" min="0" max="1.2" step="0.05" value="0.7"><span id="tempv">0.70</span></label>
+    <label>max tokens <input type="number" id="maxt" value="8192" min="16" max="32768" step="256"></label>
+    <button class="ghost" id="clear" style="height:30px;padding:0 12px">New chat</button>
+  </div>
+</footer>
+<script>
+const $ = (id) => document.getElementById(id);
+let history = [], ctrl = null, totals = { tok: 0, s: 0 };
+try { const t = localStorage.getItem("ps5chat.temp"); if (t) $("temp").value = t; const ef = localStorage.getItem("ps5chat.effort"); if (ef) $("effort").value = ef; const mt = localStorage.getItem("ps5chat.maxt"); if (mt) $("maxt").value = mt; } catch (e) {}
+$("tempv").textContent = (+$("temp").value).toFixed(2);
+$("temp").oninput = () => { $("tempv").textContent = (+$("temp").value).toFixed(2); try { localStorage.setItem("ps5chat.temp", $("temp").value); } catch (e) {} };
+$("effort").onchange = () => { try { localStorage.setItem("ps5chat.effort", $("effort").value); } catch (e) {} };
+$("maxt").onchange = () => { try { localStorage.setItem("ps5chat.maxt", $("maxt").value); } catch (e) {} };
+
+function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+function render(md) {  // small markdown subset: fenced code, inline code, bold, headings, paragraphs
+  const parts = md.split(/```/);
+  let out = "";
+  parts.forEach((p, i) => {
+    if (i % 2) { const nl = p.indexOf("\n"); out += "<pre><code>" + esc(nl >= 0 ? p.slice(nl + 1) : p) + "</code></pre>"; return; }
+    esc(p).split(/\n{2,}/).forEach((para) => {
+      if (!para.trim()) return;
+      let h = para.replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+      const m = h.match(/^(#{1,4})\s+(.*)$/);
+      out += m ? `<p><b>${m[2]}</b></p>` : "<p>" + h.replace(/\n/g, "<br>") + "</p>";
+    });
+  });
+  return out;
+}
+function add(role, text) {
+  $("empty")?.remove();
+  const d = document.createElement("div");
+  d.className = "msg " + role;
+  d.innerHTML = `<div class="who">${role === "user" ? "you" : "ps5"}</div><div class="body"></div>`;
+  if (role === "user") d.querySelector(".body").textContent = text;
+  $("log").appendChild(d);
+  scroll();
+  return d;
+}
+function scroll() { const m = $("main"); if (m.scrollHeight - m.scrollTop - m.clientHeight < 200) m.scrollTop = m.scrollHeight; }
+function busy(b) { $("send").disabled = b; $("stop").style.display = b ? "" : "none"; $("dot").className = "dot " + (b ? "busy" : "ok"); }
+
+async function send(text) {
+  text = (text ?? $("in").value).trim();
+  if (!text || ctrl) return;
+  $("in").value = ""; grow();
+  add("user", text);
+  history.push({ role: "user", content: text });
+  const d = add("bot", ""), body = d.querySelector(".body");
+  let content = "", reasoning = "", t0 = performance.now(), tFirst = 0, n = 0, usage = null, pf = null;
+  body.innerHTML = '<span class="cursor"></span>';
+  busy(true);
+  ctrl = new AbortController();
+  try {
+    const r = await fetch("/v1/chat/completions", {
+      method: "POST", headers: { "Content-Type": "application/json" }, signal: ctrl.signal,
+      body: JSON.stringify(Object.assign({ messages: history, stream: true, temperature: +$("temp").value, top_p: 0.95,
+                             max_tokens: +$("maxt").value, ps5lm_progress: true },
+                             $("effort").value === "auto" ? {} : { reasoning_effort: $("effort").value })) })
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status + " " + (await r.text()));
+    const rd = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await rd.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const ev = buf.slice(0, i); buf = buf.slice(i + 2);
+        const line = ev.split("\n").find((l) => l.startsWith("data: "));
+        if (!line) continue;
+        const data = line.slice(6);
+        if (data === "[DONE]") continue;
+        const j = JSON.parse(data);
+        if (j.usage) usage = j.usage;
+        if (j.ps5lm_prefill) { pf = j.ps5lm_prefill; paint(); }
+        const dl = j.choices?.[0]?.delta || {};
+        if (dl.content || dl.reasoning_content) {
+          if (!tFirst) tFirst = performance.now();
+          n++;
+          content += dl.content || ""; reasoning += dl.reasoning_content || "";
+          paint();
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") content += `\n\n*[error: ${e.message}]*`;
+  }
+  ctrl = null;
+  paint(true);
+  history.push(reasoning ? { role: "assistant", content, reasoning_content: reasoning } : { role: "assistant", content });
+  busy(false);
+  function paint(final) {
+    let h = "";
+    if (reasoning) h += `<details class="think"${final ? "" : " open"}><summary>thinking</summary><div>${esc(reasoning)}</div></details>`;
+    if (!final && !content && !reasoning && pf) h += `<div class="meta">reading the prompt: ${pf.done} / ${pf.total} tokens</div>`;
+    h += render(content) + (final ? "" : '<span class="cursor"></span>');
+    if (final) {
+      const p = usage?.ps5lm || {}, gen = usage?.completion_tokens ?? n;
+      const secs = (performance.now() - (tFirst || t0)) / 1000;
+      const tps = p.tps ? +p.tps : gen / Math.max(secs, 1e-3);
+      if (gen) { totals.tok += gen; totals.s += gen / tps; }
+      h += `<div class="meta">${gen} tokens${p.think_tokens ? ` (${p.think_tokens} thinking, ${p.effort}${p.think_budget_hit ? ", budget reached" : ""})` : ""} · ${tps.toFixed(1)} tok/s · prefill ${p.prefill_s ? (+p.prefill_s).toFixed(2) + " s" : "–"}` +
+           (usage?.prompt_tokens ? ` · context ${usage.prompt_tokens + gen} tok` : "") +
+           (p.hit ? ` · hit ${(+p.hit).toFixed(3)} · GPU ${(+p.gpu_ms).toFixed(1)} ms · I/O ${(+p.io_ms).toFixed(1)} ms` : "") + `</div>`;
+      $("s-tps").textContent = tps.toFixed(1);
+      if (p.hit) { $("s-hit").textContent = (+p.hit).toFixed(3); $("s-gpu").textContent = (+p.gpu_ms).toFixed(1); $("s-io").textContent = (+p.io_ms).toFixed(1); }
+      if (totals.s) $("s-avg").textContent = (totals.tok / totals.s).toFixed(1);
+    }
+    body.innerHTML = h;
+    scroll();
+  }
+}
+function grow() { const t = $("in"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 220) + "px"; }
+$("in").addEventListener("input", grow);
+$("in").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+$("send").onclick = () => send();
+$("stop").onclick = () => ctrl?.abort();
+$("clear").onclick = () => { if (ctrl) return; history = []; $("log").innerHTML = ""; };
+document.querySelectorAll(".chip").forEach((c) => c.onclick = () => send(c.textContent));
+fetch("/health").then((r) => r.ok && ($("dot").className = "dot ok")).catch(() => {});
+</script>
+</body>
+</html>

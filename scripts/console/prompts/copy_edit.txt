@@ -1,0 +1,104 @@
+Here is a Python module. Rewrite the whole module with exactly one change: rename the class `SlotCache` to `ExpertCache` everywhere. Output the full module in one code block and nothing else.
+
+```python
+import heapq
+import math
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Slot:
+    layer: int = -1
+    expert: int = -1
+    ready: bool = False
+    pinned: int = 0
+    score: float = 0.0
+    last_use: int = 0
+
+
+@dataclass
+class SlotCache:
+    n_slots: int
+    half_life: float = 36.0
+    slots: list = field(default_factory=list)
+    index: dict = field(default_factory=dict)
+    clock: int = 0
+    hits: int = 0
+    misses: int = 0
+
+    def __post_init__(self):
+        self.slots = [Slot() for _ in range(self.n_slots)]
+        self.free = list(range(self.n_slots))
+        self.decay = math.log(2.0) / self.half_life
+
+    def tick(self):
+        self.clock += 1
+
+    def _touch(self, slot):
+        age = self.clock - slot.last_use
+        slot.score = slot.score * math.exp(-self.decay * age) + 1.0
+        slot.last_use = self.clock
+
+    def _victim(self):
+        best = None
+        best_score = float("inf")
+        for i, slot in enumerate(self.slots):
+            if slot.pinned or not slot.ready:
+                continue
+            age = self.clock - slot.last_use
+            score = slot.score * math.exp(-self.decay * age)
+            if score < best_score:
+                best_score = score
+                best = i
+        return best
+
+    def lookup(self, layer, expert):
+        key = (layer, expert)
+        i = self.index.get(key)
+        if i is not None:
+            self.hits += 1
+            self._touch(self.slots[i])
+            return i, True
+        self.misses += 1
+        if self.free:
+            i = self.free.pop()
+        else:
+            i = self._victim()
+            if i is None:
+                return None, False
+            old = self.slots[i]
+            del self.index[(old.layer, old.expert)]
+        slot = self.slots[i]
+        slot.layer, slot.expert = layer, expert
+        slot.ready = False
+        slot.score = 0.0
+        slot.last_use = self.clock
+        self._touch(slot)
+        self.index[key] = i
+        return i, False
+
+    def mark_ready(self, i):
+        self.slots[i].ready = True
+
+    def pin(self, i):
+        self.slots[i].pinned += 1
+
+    def unpin(self, i):
+        self.slots[i].pinned -= 1
+
+    def hit_rate(self):
+        total = self.hits + self.misses
+        return self.hits / total if total else 0.0
+
+
+def replay(trace, n_slots):
+    cache = SlotCache(n_slots)
+    for token in trace:
+        cache.tick()
+        for layer, experts in enumerate(token):
+            for expert in experts:
+                i, hit = cache.lookup(layer, expert)
+                if i is not None and not hit:
+                    cache.mark_ready(i)
+    return cache.hit_rate()
+```

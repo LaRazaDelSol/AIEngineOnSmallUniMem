@@ -1,0 +1,42 @@
+#version 460
+// S17 one-command-buffer-per-token gate: the GPU waits (BOUNDED) until the host sets `flag` in the control buffer, then
+// copies up to three staged arrays (host-written, GPU-uncached control memory) into the engine's ordinary tables, so
+// every later kernel reads them through the normal cache hierarchy after the barrier that follows this dispatch.
+// Bound: PS5 amdgpu treats ~10 s without progress as a hang -> give up after ~2 s of the 100 MHz realtime clock, set the
+// sticky error word (every later gate then falls through at once) and leave the tables untouched; the host sees the
+// error word after the token's fence and fails the request. One wave64; all lanes read the same words (uniform).
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_realtime_clock : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent volatile buffer CV { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer W { uint v[]; };
+layout(push_constant) uniform PC {
+    uint64_t flag; uint64_t err;
+    uint64_t src0; uint64_t dst0; uint64_t src1; uint64_t dst1; uint64_t src2; uint64_t dst2;
+    uint n0; uint n1; uint n2; uint ntok;
+    uint sstr; uint dstr01; uint dstr2; uint pad;   // S18 verify: ntok token rows (src += sstr, dst0/1 += dstr01, dst2 += dstr2)
+} pc;
+
+void main() {
+    const uint lane = gl_LocalInvocationIndex;
+    CV F = CV(pc.flag), Er = CV(pc.err);
+    const uint64_t t0 = clockRealtimeEXT();
+    bool ok = false;
+    for (;;) {
+        if (Er.v[0] != 0u) break;
+        if (F.v[0] != 0u) { ok = true; break; }
+        if (clockRealtimeEXT() - t0 > 200000000ul) {  // 2 s at 100 MHz
+            if (lane == 0u) Er.v[0] = 1u;
+            break;
+        }
+    }
+    if (!ok) return;
+    const uint nt = max(pc.ntok, 1u);
+    for (uint t = 0u; t < nt; ++t) {
+        const uint64_t so = uint64_t(t) * uint64_t(pc.sstr), d01 = uint64_t(t) * uint64_t(pc.dstr01), d2 = uint64_t(t) * uint64_t(pc.dstr2);
+        if (pc.n0 != 0u) { CV s = CV(pc.src0 + so); W d = W(pc.dst0 + d01); for (uint i = lane; i < pc.n0; i += 64u) d.v[i] = s.v[i]; }
+        if (pc.n1 != 0u) { CV s = CV(pc.src1 + so); W d = W(pc.dst1 + d01); for (uint i = lane; i < pc.n1; i += 64u) d.v[i] = s.v[i]; }
+        if (pc.n2 != 0u) { CV s = CV(pc.src2 + so); W d = W(pc.dst2 + d2); for (uint i = lane; i < pc.n2; i += 64u) d.v[i] = s.v[i]; }
+    }
+}

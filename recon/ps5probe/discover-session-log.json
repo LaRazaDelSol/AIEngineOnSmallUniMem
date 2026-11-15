@@ -1,0 +1,36 @@
+{
+ "session": "2026-10-17/18 gate battery, session 2 (JB live)",
+ "console": "10.0.0.113, Pegasus DL 1.11.0 up, JB autoloader fired (elf-arsenal/shadowmount/kstuff/ps5upload/wings dirs present under /data)",
+ "native_pass": {
+  "evidence": "native-20261018-000513.json",
+  "mounts": {
+   "data_internal": "671 GB total / 261 GB free (/user/data nullfs)",
+   "ext0_usb": "256 GB total / 18 GB free (/dev/es0.crypt)",
+   "m2_under_native_os": "ABSENT (M.2 is a Linux-only partition; no native fallback via M.2)"
+  },
+  "http_pipe_mb_s": {
+   "upload": 21,
+   "download": 105,
+   "meaning": "network/1GbE ceiling, NOT nvme"
+  },
+  "copytest": {
+   "source": "/mnt/ext0/homebrew/PPSA06464.exfat (4.13 GB)",
+   "effective_mb_s": 83,
+   "meaning": "USB drive r+w combined; read-only fallback streaming roughly half; USB filler row <= ~40-80 MB/s/port, below the 0.85-1.0 GB/s/port prior"
+  },
+  "no_big_file_on_internal": "no >=1 GiB file visible under /data (games live in /appdata outside Pegasus view) -> internal-SSD bandwidth must come from the Linux/fio pass (G1)",
+  "post_run_state": "ops 1-10 all terminal; sandbox deleted; originals intact; ext0 free back to 18.1 GB (verified twice)"
+ },
+ "pegasus_api_quirks_found": [
+  "POST /api/files/copy REJECTS same-dir copies: 400 'Destination cannot be inside a selected source'",
+  "ops table registers a queued op ~1-2 s AFTER the POST response returns (race in naive wait loops)",
+  "queued ops execute CONCURRENTLY with running ops: a delete queued right after a copy can delete the copy destination mid-flight (observed failed ops 2 and 5: finalize ENOENT with done==total)",
+  "copy uses a .part temp file + rename; a mid-flight dir delete leaves no garbage (verified)"
+ ],
+ "probe_fixes": [
+  "copytest now: sandbox on same mount (never in source dir), free-headroom guard >=5 GiB, 1-64 GiB size band (target 8 GiB), 'other'/image mounts excluded",
+  "wait_op(): waits for op registration THEN terminal state, matched by (type, source); delete is queued only after terminal, with list-based verify + retry",
+  "regression smoke tools/smoke_evaluate.py passes; synthetic artifacts removed from reports/"
+ ],
+ "blocked_on": "Linux pass (G0/G1/N6/N7) needs pLinux5-NG booted: port 22 closed on .113, elfldr 9021 not resident -> launch pLinux5-NG.elf from the USB stick on-console (elf-arsenal) or push to 9021 if an ELF loader is started"
+}

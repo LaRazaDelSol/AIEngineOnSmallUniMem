@@ -1,0 +1,43 @@
+== loader e820 hole (1008 MiB)
+  001000000: zero 0.95 ff 0.02 entropy 0.48
+  003000000: zero 0.01 ff 0.00 entropy 7.96
+  005000000: zero 1.00 ff 0.00 entropy -0.00
+  007000000: zero 0.00 ff 0.00 entropy 7.96
+  009000000: zero 1.00 ff 0.00 entropy -0.00
+  00b000000: zero 0.00 ff 0.01 entropy 7.95
+  00d000000: zero 0.77 ff 0.00 entropy 2.19
+  00f000000: zero 0.78 ff 0.06 entropy 1.81
+  011000000: zero 0.77 ff 0.03 entropy 2.11
+  013000000: zero 0.78 ff 0.03 entropy 2.10
+  015000000: zero 0.31 ff 0.16 entropy 4.08
+  017000000: zero 0.67 ff 0.00 entropy 2.43
+  019000000: zero 0.77 ff 0.06 entropy 2.00
+  01b000000: zero 1.00 ff 0.00 entropy -0.00
+  01d000000: zero 0.71 ff 0.13 entropy 1.85
+  01f000000: zero 0.00 ff 0.00 entropy 7.95
+  021000000: zero 0.40 ff 0.03 entropy 4.13
+  023000000: zero 1.00 ff 0.00 entropy -0.00
+  025000000: zero 1.00 ff 0.00 entropy -0.00
+  027000000: zero 0.00 ff 0.00 entropy 7.95
+  029000000: zero 0.00 ff 0.01 entropy 7.96
+  02b000000: zero 0.00 ff 0.00 entropy 7.96
+  02d000000: zero 0.02 ff 0.00 entropy 7.94
+  02f000000: zero 0.00 ff 0.00 entropy 7.96
+  031000000: zero 0.25 ff 0.00 entropy 5.71
+  033000000: zero 0.02 ff 0.00 entropy 7.92
+  035000000: zero 0.06 ff 0.00 entropy 5.50
+  037000000: zero 0.80 ff 0.01 entropy 1.73
+  039000000: zero 0.65 ff 0.01 entropy 2.87
+  03b000000: zero 0.01 ff 0.00 entropy 7.93
+  03d000000: zero 0.00 ff 0.00 entropy 7.95
+  03f000000: zero 0.75 ff 0.06 entropy 2.04
+== 0x60000000 (12 MiB)
+  060000000: zero 0.00 ff 1.00 entropy -0.00
+  060400000: zero 0.00 ff 1.00 entropy -0.00
+  060800000: zero 0.00 ff 1.00 entropy -0.00
+== HV_BASE_REGULAR (32 MiB)
+  062800000: zero 0.35 ff 0.44 entropy 2.67
+  063000000: zero 0.00 ff 0.00 entropy 7.95
+  063800000: zero 0.15 ff 0.04 entropy 6.26
+  064000000: zero 0.00 ff 1.00 entropy -0.00
+  064800000: zero 0.27 ff 0.06 entropy 5.06

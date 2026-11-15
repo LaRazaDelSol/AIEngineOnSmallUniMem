@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  engine-model:
+    name: physics ledger + gate (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Engine tests
+        run: python -m unittest discover -s engine/tests -v
+      - name: Probe tooling smoke
+        run: python tools/smoke_evaluate.py
+      - name: Runtime tools compile
+        run: python -m compileall -q runtime/tools tools scripts
+
+  runtime:
+    name: runtime (portable tests, shaders, engine compile)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14 liburing-dev libvulkan-dev glslc shellcheck
+      - name: Portable tests (slot cache, quant, trace replay)
+        run: |
+          cmake -S runtime -B build/host -G Ninja -DCMAKE_CXX_COMPILER=g++-14 -DPS5LM_NATIVE=OFF -DPS5LM_BUILD_BENCH=OFF
+          cmake --build build/host --target trace_replay test_slot_cache test_quant
+          ctest --test-dir build/host --output-on-failure
+      - name: Every shader variant compiles
+        run: cmake --build build/host --target ps5lm_shaders
+      - name: Engine compiles with the console flags (no GPU in CI; scripts/console/smoke.sh is the functional gate)
+        run: |
+          cmake -S runtime -B build/ps5 -G Ninja -DCMAKE_CXX_COMPILER=g++-14 -DPS5LM_BUILD_BENCH=OFF
+          cmake --build build/ps5 --target flash_decode
+      - name: Shell scripts
+        run: shellcheck -S error scripts/*.sh scripts/console/*.sh ps5/appliance/*.sh

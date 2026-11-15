@@ -1,0 +1,268 @@
+﻿diag-start 00:06:37 uptime:544.92 8522.48
+
+===== PSI_IO_MEMORY_CPU =====
+some avg10=0.75 avg60=0.81 avg300=0.34 total=3139341
+full avg10=0.75 avg60=0.81 avg300=0.33 total=2935556
+some avg10=0.00 avg60=0.00 avg300=0.00 total=8
+full avg10=0.00 avg60=0.00 avg300=0.00 total=7
+some avg10=0.00 avg60=0.00 avg300=0.00 total=739790
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+
+===== KERNEL_CMDLINE =====
+Linux ps5 7.2.3 #6 SMP PREEMPT_DYNAMIC Sun Oct 25 17:26:17 EDT 2026 x86_64 GNU/Linux
+root=LABEL=cachyos-m2 ps5m2=444972662784:549755813888:2000409264:cachyos-m2 rw rootwait console=ttyTitania0 console=tty0 video=DP-1:1920x1080@60 mitigations=off idle=halt preempt=full
+
+===== DMESG_IO_ERRORS =====
+[    0.204786] usb usb3: Product: xHCI Host Controller
+[    0.204789] usb usb3: Manufacturer: Linux 7.2.3 xhci-hcd
+[    0.204791] usb usb3: SerialNumber: 0000:20:00.5
+[    0.204838] hub 3-0:1.0: USB hub found
+[    0.204908] usb usb4: We don't know the algorithms for LPM for this host, disabling LPM.
+[    0.204911] usb usb4: New USB device found, idVendor=1d6b, idProduct=0003, bcdDevice= 7.02
+[    0.204931] usb usb4: New USB device strings: Mfr=3, Product=2, SerialNumber=1
+[    0.204934] usb usb4: Product: xHCI Host Controller
+[    0.204936] usb usb4: Manufacturer: Linux 7.2.3 xhci-hcd
+[    0.204938] usb usb4: SerialNumber: 0000:20:00.5
+[    0.204983] hub 4-0:1.0: USB hub found
+[    0.205098] usbcore: registered new interface driver uas
+[    0.205116] usbcore: registered new interface driver usb-storage
+[    0.652098] usb 2-1: new SuperSpeed Plus Gen 2x1 USB device number 2 using xhci_hcd
+[    0.668247] usb 2-1: New USB device found, idVendor=152d, idProduct=0583, bcdDevice= 2.13
+[    0.686012] usb 2-1: New USB device strings: Mfr=1, Product=2, SerialNumber=3
+[    0.692135] usb 2-1: Product: USB to PCIE Bridge
+[    0.696366] usb 2-1: Manufacturer: JMicron
+[    0.700596] usb 2-1: SerialNumber: 0123456789ABCDEF
+[    0.821128] usb 2-2: new SuperSpeed USB device number 3 using xhci_hcd
+[    0.836601] usb 2-2: New USB device found, idVendor=154b, idProduct=1006, bcdDevice= 1.10
+[    1.233926] usb 2-2: New USB device strings: Mfr=1, Product=2, SerialNumber=3
+[    2.430407] usb 2-2: Product: USB 3.2.1 FD
+[    2.432430] usb 2-2: Manufacturer: PNY
+[    2.432432] usb 2-2: SerialNumber: <redacted>
+[    2.441846] usb-storage 2-2:1.0: USB Mass Storage device detected
+[    2.446773] scsi host1: usb-storage 2-2:1.0
+[    2.475423] xhci_hcd 0000:40:00.6: new USB bus registered, assigned bus number 5
+[    2.482176] xhci_hcd 0000:40:00.6: // Reset the HC on custom Salina Reset
+[    2.556730] xhci_hcd 0000:40:00.6: USB0 root hub has no ports
+[    2.561809] usb usb5: New USB device found, idVendor=1d6b, idProduct=0002, bcdDevice= 7.02
+[    2.565927] usb usb5: New USB device strings: Mfr=3, Product=2, SerialNumber=1
+[    2.569470] usb usb5: Product: xHCI Host Controller
+[    2.571888] usb usb5: Manufacturer: Linux 7.2.3 xhci-hcd
+[    2.574520] usb usb5: SerialNumber: 0000:40:00.6
+[    2.576889] hub 5-0:1.0: USB hub found
+[    2.839325] usb 5-3: new high-speed USB device number 2 using xhci_hcd
+[    3.041929] usb 5-3: New USB device found, idVendor=1286, idProduct=2059, bcdDevice=32.01
+[    3.167941] usb 5-3: New USB device strings: Mfr=1, Product=2, SerialNumber=3
+[    3.168020] usb 5-3: Product: Bluetooth and Wireless LAN Composite Device
+[    3.169288] usb 5-3: Manufacturer: Marvell
+[    3.171316] usb 5-3: SerialNumber: 0000000000000000
+[    3.470337] scsi 1:0:0:0: Direct-Access     PNY      USB 3.2.1 FD     PMAP PQ: 0 ANSI: 6
+[    8.725442] ata1: SATA max UDMA/133 irq 46 lpm-pol 0
+[    8.728243] nvme nvme0: pci function 0000:40:02.5
+[    8.750524] nvme nvme0: passthrough uses implicit buffer lengths
+[    8.756827] nvme nvme0: allocated 64 MiB host memory buffer (16 segments).
+[    8.780648] nvme nvme0: 16/0/0 default/read/poll queues
+[    8.789047]  nvme0n1: p1
+[    9.043238] ata1: SATA link down (SStatus 0 SControl 300)
+[    9.102048] EXT4-fs (nvme0n1p1): mounted filesystem e0c6b44e-486e-4f30-9f50-aa8fb58a7e29 r/w with ordered data mode. Quota mode: none.
+[    9.568579] systemd[1]: Listening on Factory Reset Management.
+[    9.779643] EXT4-fs (nvme0n1p1): re-mounted e0c6b44e-486e-4f30-9f50-aa8fb58a7e29.
+[   10.283397] Modules linked in: btrtl snd_hwdep moal(O+) btintel btbcm snd_pcm kvm btmtk mlan(O) snd_timer snd bluetooth irqbypass cfg80211 soundcore k10temp mts overlay autofs4 aesni_intel nvme gf128mul nvme_core ahci_salina_drv libahci amdgpu i2c_algo_bit drm_buddy drm_ttm_helper ttm video drm_exec drm_suballoc_helper mfd_core drm_panel_backlight_quirks gpu_sched amdxcp drm_display_helper
+[   10.309500] btusb 5-3:1.2: Interface 2 is not authorized for usage
+[   10.311374] usbcore: registered new interface driver btusb
+[   30.937128] block nvme0n1: No UUID available providing old NGUID
+[  503.042099] input: DualSense Wireless Controller as /devices/pci0000:00/0000:00:01.1/0000:40:00.6/usb5/5-3/5-3:1.0/bluetooth/hci0/hci0:1/0005:054C:0CE6.0001/input/input5
+[  503.042190] input: DualSense Wireless Controller Motion Sensors as /devices/pci0000:00/0000:00:01.1/0000:40:00.6/usb5/5-3/5-3:1.0/bluetooth/hci0/hci0:1/0005:054C:0CE6.0001/input/input6
+[  503.042239] input: DualSense Wireless Controller Touchpad as /devices/pci0000:00/0000:00:01.1/0000:40:00.6/usb5/5-3/5-3:1.0/bluetooth/hci0/hci0:1/0005:054C:0CE6.0001/input/input7
+
+===== BLOCK_DEVICES =====
+NAME          SIZE TYPE FSTYPE MOUNTPOINT MODEL                   SERIAL
+sda         238.5G disk                   Generic                 0123456789ABCDEF
+sdb         115.5G disk                   USB 3.2.1 FD            071C3A364E8D6671
+`-sdb1         32G part vfat   /boot/efi                          
+nvme0n1     953.9G disk                   MTFDKBA1T0QFM-1BD1AABGB 2408470F483A
+`-nvme0n1p1   512G part ext4   /                                  
+TARGET SOURCE         FSTYPE OPTIONS
+/      /dev/nvme0n1p1 ext4   rw,relatime
+Filesystem      Size  Used Avail Use% Mounted on
+dev             6.3G     0  6.3G   0% /dev
+run             7.1G  1.3M  7.1G   1% /run
+/dev/nvme0n1p1  504G   23G  481G   5% /
+none            1.0M     0  1.0M   0% /run/credentials/systemd-journald.service
+/dev/sdb1        32G  719M   32G   3% /boot/efi
+none            1.0M     0  1.0M   0% /run/credentials/systemd-networkd.service
+none            1.0M     0  1.0M   0% /run/credentials/systemd-resolved.service
+none            1.0M     0  1.0M   0% /run/credentials/serial-getty@ttyTitania0.service
+none            1.0M     0  1.0M   0% /run/credentials/getty@tty1.service
+
+===== USB_DETAILS =====
+/sys/bus/usb/devices/2-1: 10000 Mbps
+/sys/bus/usb/devices/2-2: 5000 Mbps
+/sys/bus/usb/devices/5-3: 480 Mbps
+/sys/bus/usb/devices/usb1: 480 Mbps
+/sys/bus/usb/devices/usb2: 10000 Mbps
+/sys/bus/usb/devices/usb3: 480 Mbps
+/sys/bus/usb/devices/usb4: 10000 Mbps
+/sys/bus/usb/devices/usb5: 480 Mbps
+hub
+hub
+uas
+usb-storage
+hub
+hub
+hub
+btusb
+btusb
+/sys/bus/usb/devices/2-1: on
+/sys/bus/usb/devices/2-2: on
+/sys/bus/usb/devices/5-3: on
+/sys/bus/usb/devices/usb1: auto
+/sys/bus/usb/devices/usb2: auto
+/sys/bus/usb/devices/usb3: auto
+/sys/bus/usb/devices/usb4: auto
+/sys/bus/usb/devices/usb5: auto
+
+===== ROOT_BENCH =====
+root source: /dev/nvme0n1p1
+read-bench /dev/nvme0n1 (512 MiB, direct I/O, read-only):
+dd: failed to open '/dev/nvme0n1': Permission denied
+
+===== NVME_HEALTH =====
+/sys/class/nvme/nvme0 model=MTFDKBA1T0QFM-1BD1AABGB                  fw=V3MA101 
+  temp: 35 C
+
+===== D_STATE_TASKS =====
+
+===== MEM =====
+               total        used        free      shared  buff/cache   available
+Mem:            14Gi       3.2Gi       7.2Gi       115Mi       4.2Gi        10Gi
+Swap:             0B          0B          0B
+
+===== TOP_RSS =====
+USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND
+steam       3873 60.1 11.6 269116116 1722784 ?   RNl  00:05   0:27 /usr/lib/kf6/baloo_file_extractor
+steam       3827 30.2  5.0 49472904 741432 ?     Sl   00:05   0:14 /home/steam/.local/share/Steam/ubuntu12_64/steamwebhelper --type=zygote --enable-crash-reporter=, --change-stack-guard-on-fork=enable --enable-chrome-runtime --user-data-dir=/home/steam/.local/share/Steam/config/htmlcache --user-agent-product=Valve Steam Client --buildid=1792618285 --steamid=0 --valve-initial-threadpool-size=4
+steam       3731  5.1  2.8 2507676 424404 ?      Sl   00:05   0:02 ./steamwebhelper -nocrashdialog -lang=en_US -cachedir=/home/steam/.local/share/Steam/config/htmlcache -steampid=3322 -buildid=1792618285 -steamid=0 -logdir=/home/steam/.local/share/Steam/logs -uimode=7 -startcount=0 -steamuniverse=Public -realm=Global -clientui=/home/steam/.local/share/Steam/clientui -steampath=/home/steam/.local/share/Steam/ubuntu12_32/steam -launcher=0 --valve-initial-threadpool-size=4 --valve-enable-site-isolation --crl-sets-path=/home/steam/.local/share/Steam/resource/crl-set --enable-smooth-scrolling --password-store=basic --log-file=/home/steam/.local/share/Steam/logs/cef_log.txt --disable-quick-menu --disable-component-update --gaia-url=http://disabled.invalid --enable-features=PlatformHEVCDecoderSupport --disable-features=WinRetrieveSuggestionsOnlyOnDemand,SpareRendererForSitePerProcess,BlockPromptsIfIgnoredOften,WebUsbDeviceDetection,ValveFFmpegAllowLowDelayHEVC
+steam       2855  4.8  2.1 2161016 323456 ?      Ssl  00:05   0:02 /usr/bin/plasmashell --no-respawn
+steam       3322  6.1  1.5 1028260 230124 ?      Sl   00:05   0:03 /home/steam/.local/share/Steam/ubuntu12_32/steam -srt-logger-opened -silent
+steam       2846  5.5  1.4 2207648 214864 ?      Rl   00:05   0:03 /usr/bin/kwin_wayland --wayland-fd 7 --socket wayland-1 --xwayland-fd 8 --xwayland-fd 9 --xwayland-display :0 --xwayland-initfd 11 --xwayland-init-display :1 --xwayland-xauthority /run/user/1000/xauth_kLFrjs --xwayland
+steam       4022  3.4  1.4 49301040 211584 ?     Sl   00:05   0:01 /home/steam/.local/share/Steam/ubuntu12_64/steamwebhelper --type=zygote --enable-crash-reporter=, --change-stack-guard-on-fork=enable --enable-chrome-runtime --user-data-dir=/home/steam/.local/share/Steam/config/htmlcache --user-agent-product=Valve Steam Client --buildid=1792618285 --steamid=0 --valve-initial-threadpool-size=4
+steam       3759 10.2  1.3 1929500 196088 ?      Sl   00:05   0:04 /home/steam/.local/share/Steam/ubuntu12_64/steamwebhelper --type=zygote --no-zygote-sandbox --enable-crash-reporter=, --change-stack-guard-on-fork=enable --enable-chrome-runtime --user-data-dir=/home/steam/.local/share/Steam/config/htmlcache --user-agent-product=Valve Steam Client --buildid=1792618285 --steamid=0 --valve-initial-threadpool-size=4
+steam       4139  0.0  0.8 49131340 122092 ?     Sl   00:06   0:00 /home/steam/.local/share/Steam/ubuntu12_64/steamwebhelper --type=zygote --enable-crash-reporter=, --change-stack-guard-on-fork=enable --enable-chrome-runtime --user-data-dir=/home/steam/.local/share/Steam/config/htmlcache --user-agent-product=Valve Steam Client --buildid=1792618285 --steamid=0 --valve-initial-threadpool-size=4
+steam       3808  0.8  0.7 892348 112024 ?       Sl   00:05   0:00 /proc/self/exe --type=utility --utility-sub-type=network.mojom.NetworkService --lang=en-US --service-sandbox-type=none --enable-crash-reporter=, --change-stack-guard-on-fork=enable --enable-chrome-runtime --user-data-dir=/home/steam/.local/share/Steam/config/htmlcache --user-agent-product=Valve Steam Client --buildid=1792618285 --steamid=0 --valve-initial-threadpool-size=4 --shared-files --field-trial-handle=3,i,11872537581582348991,4711384732109151844,262144 --enable-features=PlatformHEVCDecoderSupport --disable-features=BlockPromptsIfIgnoredOften,SpareRendererForSitePerProcess,ValveFFmpegAllowLowDelayHEVC,WebUsbDeviceDetection,WinRetrieveSuggestionsOnlyOnDemand --variations-seed-version --log-file=/home/steam/.local/share/Steam/logs/cef_log.txt
+steam       2948  2.1  0.6 995344 90516 ?        Sl   00:05   0:01 /usr/bin/Xwayland :0 -auth /run/user/1000/xauth_kLFrjs -listenfd 8 -listenfd 9 -displayfd 78 -wm 81 -initfd 11 -rootless
+steam       2851  0.5  0.5 1458652 85956 ?       Ssl  00:05   0:00 /usr/bin/kded6
+steam       3737  0.0  0.5 300612 78108 ?        S    00:05   0:00 /home/steam/.local/share/Steam/ubuntu12_64/steamwebhelper --type=zygote --enable-crash-reporter=, --change-stack-guard-on-fork=enable --enable-chrome-runtime --user-data-dir=/home/steam/.local/share/Steam/config/htmlcache --user-agent-product=Valve Steam Client --buildid=1792618285 --steamid=0 --valve-initial-threadpool-size=4
+
+===== TOP_CPU =====
+steam       3873 60.1 11.6 269116116 1722836 ?   RNl  00:05   0:27 /usr/lib/kf6/baloo_file_extractor
+steam       3827 30.2  5.0 49472904 741432 ?     Sl   00:05   0:14 /home/steam/.local/share/Steam/ubuntu12_64/steamwebhelper --type=zygote --enable-crash-reporter=, --change-stack-guard-on-fork=enable --enable-chrome-runtime --user-data-dir=/home/steam/.local/share/Steam/config/htmlcache --user-agent-product=Valve Steam Client --buildid=1792618285 --steamid=0 --valve-initial-threadpool-size=4
+steam       3759 10.2  1.3 1929500 196088 ?      Sl   00:05   0:04 /home/steam/.local/share/Steam/ubuntu12_64/steamwebhelper --type=zygote --no-zygote-sandbox --enable-crash-reporter=, --change-stack-guard-on-fork=enable --enable-chrome-runtime --user-data-dir=/home/steam/.local/share/Steam/config/htmlcache --user-agent-product=Valve Steam Client --buildid=1792618285 --steamid=0 --valve-initial-threadpool-size=4
+steam       3322  6.1  1.5 1028260 230124 ?      Sl   00:05   0:03 /home/steam/.local/share/Steam/ubuntu12_32/steam -srt-logger-opened -silent
+steam       2846  5.5  1.4 2207648 214864 ?      Sl   00:05   0:03 /usr/bin/kwin_wayland --wayland-fd 7 --socket wayland-1 --xwayland-fd 8 --xwayland-fd 9 --xwayland-display :0 --xwayland-initfd 11 --xwayland-init-display :1 --xwayland-xauthority /run/user/1000/xauth_kLFrjs --xwayland
+steam       3731  5.1  2.8 2507676 424404 ?      Sl   00:05   0:02 ./steamwebhelper -nocrashdialog -lang=en_US -cachedir=/home/steam/.local/share/Steam/config/htmlcache -steampid=3322 -buildid=1792618285 -steamid=0 -logdir=/home/steam/.local/share/Steam/logs -uimode=7 -startcount=0 -steamuniverse=Public -realm=Global -clientui=/home/steam/.local/share/Steam/clientui -steampath=/home/steam/.local/share/Steam/ubuntu12_32/steam -launcher=0 --valve-initial-threadpool-size=4 --valve-enable-site-isolation --crl-sets-path=/home/steam/.local/share/Steam/resource/crl-set --enable-smooth-scrolling --password-store=basic --log-file=/home/steam/.local/share/Steam/logs/cef_log.txt --disable-quick-menu --disable-component-update --gaia-url=http://disabled.invalid --enable-features=PlatformHEVCDecoderSupport --disable-features=WinRetrieveSuggestionsOnlyOnDemand,SpareRendererForSitePerProcess,BlockPromptsIfIgnoredOften,WebUsbDeviceDetection,ValveFFmpegAllowLowDelayHEVC
+steam       2855  4.8  2.1 2161016 323456 ?      Ssl  00:05   0:02 /usr/bin/plasmashell --no-respawn
+steam       4022  3.4  1.4 49301040 211584 ?     Sl   00:05   0:01 /home/steam/.local/share/Steam/ubuntu12_64/steamwebhelper --type=zygote --enable-crash-reporter=, --change-stack-guard-on-fork=enable --enable-chrome-runtime --user-data-dir=/home/steam/.local/share/Steam/config/htmlcache --user-agent-product=Valve Steam Client --buildid=1792618285 --steamid=0 --valve-initial-threadpool-size=4
+steam       2948  2.1  0.6 995344 90516 ?        Sl   00:05   0:01 /usr/bin/Xwayland :0 -auth /run/user/1000/xauth_kLFrjs -listenfd 8 -listenfd 9 -displayfd 78 -wm 81 -initfd 11 -rootless
+
+===== GPU_PCI_DRM =====
+00:01.1 PCI bridge: Advanced Micro Devices, Inc. [AMD] Device 13df
+20:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Cyan Skillfish [PlayStation 5 APU]
+20:00.1 Audio device: Advanced Micro Devices, Inc. [AMD/ATI] Cyan Skillfish HDMI/DP Audio Controller
+20:00.4 USB controller: Advanced Micro Devices, Inc. [AMD] Ariel USB 3.1 Type A: Gen2 x 2 ports
+20:00.5 USB controller: Advanced Micro Devices, Inc. [AMD] Ariel USB 3.1 Type C: Gen2 x 1port + DP Alt Mode
+20:00.6 Multimedia controller: Advanced Micro Devices, Inc. [AMD] Ariel HD Audio Coprocessor
+40:00.1 Non-VGA unclassified device: Sony Corporation Salina PCIe Controller (rev 01)
+40:00.2 System peripheral: Sony Corporation Salina Ethernet Controller (rev 01)
+40:00.6 System peripheral: Sony Corporation Salina USB xHCI Host Controller (rev 01)
+40:00.7 Ethernet controller: Marvell Technology Group Ltd. NXP IW620 Wi-Fi 6 (ax) + Bluetooth 5.3 Combo (rev 02)
+40:01.0 Non-VGA unclassified device: Sony Corporation Device 90f3 (rev 01)
+40:01.1 Non-VGA unclassified device: Sony Corporation Device 90f4 (rev 01)
+40:01.2 Non-VGA unclassified device: Sony Corporation Device 90f5 (rev 01)
+40:01.3 Non-VGA unclassified device: Sony Corporation Device 90f6 (rev 01)
+40:01.4 Non-VGA unclassified device: Sony Corporation Device 90f7 (rev 01)
+40:01.5 Non-VGA unclassified device: Sony Corporation Device 90f8 (rev 01)
+40:01.6 Non-VGA unclassified device: Sony Corporation Device 90f9 (rev 01)
+40:01.7 Non-VGA unclassified device: Sony Corporation Device 90fa (rev 01)
+40:02.0 Non-VGA unclassified device: Sony Corporation Device 90fb (rev 01)
+40:02.1 Non-VGA unclassified device: Sony Corporation Device 90fc (rev 01)
+40:02.2 Non-VGA unclassified device: Sony Corporation Device 90fd (rev 01)
+40:02.3 Non-VGA unclassified device: Sony Corporation Device 90fe (rev 01)
+40:02.4 Non-VGA unclassified device: Sony Corporation Device 90ff (rev 01)
+40:02.5 Non-Volatile memory controller: Micron Technology Inc 2400 NVMe SSD (DRAM-less) (rev 03)
+40:02.6 Non-VGA unclassified device: Sony Corporation Device 9101 (rev 01)
+40:02.7 Non-VGA unclassified device: Sony Corporation Device 9102 (rev 01)
+total 0
+drwxr-xr-x  2 root root         80 Oct 26 20:20 by-path
+crw-rw----+ 1 root video  226,   0 Oct 27 00:05 card0
+crw-rw-rw-  1 root render 226, 128 Oct 26 20:20 renderD128
+/sys/class/drm/card0/device/mem_info_vram_total = 536870912
+/sys/class/drm/card0/device/mem_info_gtt_total = 7568400384
+
+===== INTERNAL_SSD_PRESENT =====
+/dev/nvme0
+/dev/nvme0n1
+/dev/nvme0n1p1
+
+===== SERVICES =====
+multi-user.target
+bluetooth.service                       enabled disabled
+first-boot.service                      enabled disabled
+getty@.service                          enabled enabled
+NetworkManager-dispatcher.service       enabled disabled
+NetworkManager-wait-online.service      enabled disabled
+NetworkManager.service                  enabled disabled
+nm-ensure.service                       enabled disabled
+ps5-kexec-load.service                  enabled disabled
+ps5-session-default.service             enabled disabled
+ps5-stage-firmware.service              enabled disabled
+ps5boost.service                        enabled disabled
+ps5fan.service                          enabled disabled
+sshd.service                            enabled disabled
+systemd-boot-clear-sysfail.service      enabled enabled
+systemd-boot-update.service             enabled enabled
+systemd-confext.service                 enabled enabled
+systemd-coredumpd.service               enabled enabled
+systemd-homed-activate.service          enabled enabled
+systemd-homed.service                   enabled enabled
+systemd-network-generator.service       enabled enabled
+systemd-networkd-wait-online.service    enabled enabled
+systemd-networkd.service                enabled enabled
+systemd-pstore.service                  enabled enabled
+systemd-resolved.service                enabled enabled
+systemd-sysext.service                  enabled enabled
+systemd-timesyncd.service               enabled enabled
+systemd-tpm2-clear.service              enabled enabled
+wifi-ensure.service                     enabled disabled
+systemd-journalctl-metrics.socket       enabled enabled
+systemd-journald-audit.socket           enabled enabled
+
+===== TOOLS =====
+have: curl
+have: wget
+have: python3
+have: gcc
+have: make
+have: git
+have: nvme
+have: smartctl
+have: vulkaninfo
+have: clinfo
+have: sensors
+have: pacman
+have: flatpak
+have: steam
+have: gamescope
+ldd (GNU libc) 2.44
+uid=1000(steam) gid=1000(steam) groups=1000(steam),967(seat),983(video),992(input),995(audio),998(wheel)
+
+===== THERMAL_ZONES =====
+
+===== DONE =====
+diag-end 00:06:38
+ssh : bash: line 70: $'\r': command not found
+At line:1 char:41
++ ... g.sh -Raw | ssh -i .ssh/ps5_ed25519 -o BatchMode=yes steam@10.0.0.113 ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (bash: line 70: $'\r': command not found:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

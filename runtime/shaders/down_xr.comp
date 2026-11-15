@@ -1,0 +1,54 @@
+#version 460
+// Routed-expert down + combine with the activations in REGISTERS (S14). Same contract as down_combine.comp:
+//   out[r] = resid[r] + sum_e wt[e] * (down_e[r] . h_e),   e < n_exp (<= NEXP_MAX)
+// down_combine re-gathers 16 activations from the cache for every quant word of every row (64 B of x per
+// 4 B of weights; 46 us/layer at Q2). Here lane l owns the fixed (expert, word) positions idx = l + 64*it of
+// the concatenated n_exp x QW row, loads their activations ONCE, then streams rows_per_wave rows.
+#include "common.glsl"
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC {
+    uint64_t h; uint64_t slots; uint64_t wt; uint64_t resid; uint64_t outp; uint n_exp; uint rows_per_wave;
+} pc;
+const uint NEXP_MAX = 10u;
+const uint QW = (FFN / 32u) * QWPB;              // 40 (Q2) / 80 (Q4) words per expert row
+const uint ITERS = (NEXP_MAX * QW + 63u) / 64u;  // 7 (Q2) / 13 (Q4)
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint SW = scale_words(FFN), RW = row_words(FFN), RWH = row_words(HIDDEN);
+    const uint down_off = 2u * FFN * RWH;
+    U64 S = U64(pc.slots);
+    F32 WT = F32(pc.wt);
+    const uint total = pc.n_exp * QW;
+    float xv[ITERS][16];
+    float sx[ITERS], we[ITERS];
+    uint wd[ITERS];
+    uint64_t base[ITERS];
+    [[unroll]] for (uint it = 0u; it < ITERS; ++it) {
+        const uint idx = lane + 64u * it;
+        if (idx < total) {
+            const uint e = idx / QW, w = idx - e * QW;
+            load_x(V4(pc.h + uint64_t(e * FFN * 4u)), w, xv[it], sx[it]);
+            we[it] = WT.v[e];
+            wd[it] = w;
+            base[it] = S.v[e];
+        } else {
+            sx[it] = 0.0; we[it] = 0.0; wd[it] = 0u; base[it] = S.v[0];
+            [[unroll]] for (uint v = 0u; v < 16u; ++v) xv[it][v] = 0.0;
+        }
+    }
+    const uint r0 = gl_WorkGroupID.x * pc.rows_per_wave;
+    for (uint rr = 0u; rr < pc.rows_per_wave; ++rr) {
+        const uint r = r0 + rr;
+        if (r >= HIDDEN) break;
+        const uint rb = down_off + r * RW;
+        float acc = 0.0;
+        [[unroll]] for (uint it = 0u; it < ITERS; ++it) {
+            if (lane + 64u * it < total) {
+                U32 W = U32(base[it]);
+                acc += we[it] * block_scale(W, rb, wd[it]) * word_dot(W.v[rb + SW + wd[it]], xv[it], sx[it]);
+            }
+        }
+        acc = subgroupAdd(acc);
+        if (lane == 0u) F32(pc.outp).v[r] = F32(pc.resid).v[r] + acc;
+    }
+}

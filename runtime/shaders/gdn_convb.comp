@@ -1,0 +1,25 @@
+#version 460
+// S18 stage C: gdn_conv.comp for T tokens of a verify batch in one dispatch. Token t's input/output advance by st bytes;
+// the conv state is read once, and the state after token t goes to so[t] (verify checkpoints; the last one = live).
+// Per token the arithmetic is gdn_conv.comp's (bit-identical).
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t x; uint64_t w; uint64_t state; uint64_t outp; uint64_t so0; uint64_t so1; uint64_t so2; uint64_t so3; uint n; uint st; uint nt; uint pad; } pc;
+void main() {
+    const uint ch = gl_GlobalInvocationID.x;
+    if (ch >= pc.n) return;
+    F32 Wt = F32(pc.w), S = F32(pc.state);
+    float s0 = S.v[ch * 3u], s1 = S.v[ch * 3u + 1u], s2 = S.v[ch * 3u + 2u];
+    const float w0 = Wt.v[ch * 4u], w1 = Wt.v[ch * 4u + 1u], w2 = Wt.v[ch * 4u + 2u], w3 = Wt.v[ch * 4u + 3u];
+    for (uint t = 0u; t < pc.nt; ++t) {
+        const uint64_t off = uint64_t(t) * uint64_t(pc.st);
+        const float xv = F32(pc.x + off).v[ch];
+        const float a = w0 * s0 + w1 * s1 + w2 * s2 + w3 * xv;
+        F32(pc.outp + off).v[ch] = a / (1.0 + exp(-a));
+        F32 SO = F32(t == 0u ? pc.so0 : t == 1u ? pc.so1 : t == 2u ? pc.so2 : pc.so3);
+        s0 = s1; s1 = s2; s2 = xv;
+        SO.v[ch * 3u] = s0;
+        SO.v[ch * 3u + 1u] = s1;
+        SO.v[ch * 3u + 2u] = s2;
+    }
+}

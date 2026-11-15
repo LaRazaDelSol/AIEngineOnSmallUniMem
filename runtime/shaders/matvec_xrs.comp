@@ -1,0 +1,95 @@
+#version 460
+// S19: dense PS5Q4 matvec with x held in REGISTERS, one wave per workgroup, rpw rows per wave, the next row's quant +
+// scale words loaded while the current row is computed (software pipelined), every load addressed as a uniform 64-bit
+// row base + 32-bit lane offset + immediate (saddr form). Requires (KDIM / 32) * 4 to be a multiple of 64.
+// BIT-IDENTICAL to the kernel it replaces: every lane visits the same quant words (w = lane + 64 it, ascending), forms
+// s and acc with the same expressions in the same order and reduces with the same subgroupAdd; sx is summed like the
+// replaced kernel (SXMODE 0 = matvec_lds.comp, x0+..+x7 in order: K = 6144; SXMODE 1 = load_x of matvec_xr.comp /
+// matvec_xrb.comp, (x0+x1+x2+x3) + (x4+..+x7): K = 2560). NB > 1: NB token columns (weights read once per row,
+// stage C verify), each column identical to the single-token result.
+#define BITS 4
+#include "common.glsl"
+#ifndef KDIM
+#define KDIM 6144
+#endif
+#ifndef NB
+#define NB 1
+#endif
+#ifndef SXMODE
+#define SXMODE 0
+#endif
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint64_t w; uint64_t x; uint64_t y; uint K; uint N; uint rpw; uint mode; float alpha; uint xs; uint ys; uint nb; } pc;
+const uint QW = (KDIM / 32u) * QWPB;   // quant words per row (768 for 6144, 320 for 2560)
+const uint IT = QW / 64u;              // words per lane per row (12 / 5)
+void main() {
+    const uint lane = gl_SubgroupInvocationID;
+    const uint SW = scale_words(KDIM), RW = row_words(KDIM);
+    vec4 lo[NB][IT], hi[NB][IT];
+    float sx[NB][IT];
+    [[unroll]] for (uint c = 0u; c < NB; ++c) {
+        const uint64_t xp = pc.x + uint64_t(c) * uint64_t(pc.xs);
+        const uint xoff = ((lane >> 2) * 8u + (lane & 3u)) * 16u;   // word w = lane + 64 it: block 16 it + lane/4
+        [[unroll]] for (uint it = 0u; it < IT; ++it) {
+            lo[c][it] = V4(xp + uint64_t(xoff + 2048u * it)).v[0];
+            hi[c][it] = V4(xp + uint64_t(xoff + 2048u * it + 64u)).v[0];
+            const vec4 l = lo[c][it], h = hi[c][it];
+#if SXMODE == 0
+            sx[c][it] = l.x + l.y + l.z + l.w + h.x + h.y + h.z + h.w;
+#else
+            sx[c][it] = (l.x + l.y + l.z + l.w) + (h.x + h.y + h.z + h.w);
+#endif
+        }
+    }
+    const uint r0 = gl_WorkGroupID.x * pc.rpw;
+    // S19: addresses = uniform 64-bit row base (SGPRs) + a 32-bit per-lane offset + a compile-time immediate, so the
+    // loads compile to global_load saddr+voffset+imm (the W.v[index] form cost ~6 VALU ops of 64-bit math per load).
+    const uint qoff = (SW + lane) * 4u;          // quant word `lane` of the row, + 256 B per it
+    const uint soff = (lane >> 3) * 4u;          // scale word of block (lane >> 2) >> 1, + 32 B per it
+    uint qn[IT], sn[IT];
+    if (r0 < pc.N) {
+        const uint64_t rp = pc.w + uint64_t(r0) * uint64_t(RW * 4u);
+        [[unroll]] for (uint it = 0u; it < IT; ++it) {
+            qn[it] = U32(rp + uint64_t(qoff + 256u * it)).v[0];
+            sn[it] = U32(rp + uint64_t(soff + 32u * it)).v[0];
+        }
+    }
+    for (uint rr = 0u; rr < pc.rpw; ++rr) {
+        const uint r = r0 + rr;
+        if (r >= pc.N) break;
+        uint q[IT], sw[IT];
+        [[unroll]] for (uint it = 0u; it < IT; ++it) { q[it] = qn[it]; sw[it] = sn[it]; }
+        if (rr + 1u < pc.rpw && r + 1u < pc.N) {
+            const uint64_t rp = pc.w + uint64_t(r + 1u) * uint64_t(RW * 4u);
+            [[unroll]] for (uint it = 0u; it < IT; ++it) {
+                qn[it] = U32(rp + uint64_t(qoff + 256u * it)).v[0];
+                sn[it] = U32(rp + uint64_t(soff + 32u * it)).v[0];
+            }
+        }
+        float acc[NB];
+        [[unroll]] for (uint c = 0u; c < NB; ++c) acc[c] = 0.0;
+        [[unroll]] for (uint it = 0u; it < IT; ++it) {
+            const uint w = lane + 64u * it;
+            const uint bq = w / QWPB;
+            const vec2 s2 = unpackHalf2x16(sw[it]);
+            const float bs = (bq & 1u) != 0u ? s2.y : s2.x;
+            const uint qq = q[it];
+            [[unroll]] for (uint c = 0u; c < NB; ++c) {
+                const vec4 l = lo[c][it], h = hi[c][it];
+                float s = qval(qq, 0u) * l.x + qval(qq, 1u) * l.y + qval(qq, 2u) * l.z + qval(qq, 3u) * l.w
+                        + qval(qq, 4u) * h.x + qval(qq, 5u) * h.y + qval(qq, 6u) * h.z + qval(qq, 7u) * h.w;
+                acc[c] += bs * (s - ZERO * sx[c][it]);
+            }
+        }
+        [[unroll]] for (uint c = 0u; c < NB; ++c) {
+            const float a = subgroupAdd(acc[c]) * pc.alpha;
+            if (lane == 0u) {
+                F32 Y = F32(pc.y + uint64_t(c) * uint64_t(pc.ys));
+                float o = a;
+                if (pc.mode == 2u) o = a / (1.0 + exp(-a));
+                else if (pc.mode == 3u) o = 1.0 / (1.0 + exp(-a));
+                if (pc.mode == 1u) Y.v[r] += o; else Y.v[r] = o;
+            }
+        }
+    }
+}

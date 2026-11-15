@@ -1,0 +1,21 @@
+# /etc/systemd/system/ps5lm-dash.service — AI mode, step 3 (S18): the Strata-style dashboard + chat on :8080
+# (runtime/tools/ps5lm_dash.py). It proxies every /v1/* request to ps5lm-server (:8081), records per-request numbers
+# (~steam/ps5lm/dash.jsonl) and samples the console. Inert unless ps5lm.ai=1. Stopping it never touches the engine.
+[Unit]
+Description=PS5LM dashboard + chat (Strata UI) in front of ps5lm-server
+ConditionKernelCommandLine=ps5lm.ai=1
+After=ps5lm-server.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=steam
+ExecStart=/usr/bin/python3 /home/steam/ps5lm/src/runtime/tools/ps5lm_dash.py --listen-host 0.0.0.0 --listen-port 8080 --upstream http://127.0.0.1:8081 --log /home/steam/ps5lm/dash.jsonl
+Restart=on-failure
+RestartSec=5
+Nice=5
+# a few MB of Python; it goes before anything else if memory ever runs short (after the engine's own 1000)
+OOMScoreAdjust=900
+
+[Install]
+WantedBy=multi-user.target

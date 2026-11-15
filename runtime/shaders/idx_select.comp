@@ -1,0 +1,262 @@
+#version 460
+// S19 QSA indexer token selection for one query (Qwen4ExpTextQSAIndexer.forward, decode):
+//   blocks b = tokens [4b, 4b+4) of the visible prefix, nb = (pos + 1) / 4 complete blocks;
+//   key_b = RoPE_{4b}(RMSNorm_{1+w}(mean of the 4 raw keys)), score_b = sum_h relu(q_h . key_b) / sqrt(128);
+//   the top min(512, nb) blocks' tokens + the tail tokens [4 nb, pos] are attended (<= 2051 tokens).
+// nb <= 512 -> every token is selected: writes sel[0] = 0 ("dense") and the attention reads positions 0..pos.
+// Pooled keys of blocks completed BEFORE this batch come from pk (fp16 cache, written once by the column that
+// completed the block); blocks completed inside the batch (completion position >= tpos, the batch's first position)
+// are pooled here from the per-position raw keys, by every column that needs them (identical arithmetic), and the
+// column whose position completes block b writes pk[b]. Exact top-k: bisection on the score bits (scores >= 0),
+// ties at the threshold taken in block order. Output (ascending): sel[0] = count, sel[1..] = token positions.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+#ifndef MAXB
+#define MAXB 8192
+#endif
+#ifndef RKR
+#define RKR 1024u   // S30: rk ring positions (flash_engine.hpp kRkRing)
+#endif
+layout(local_size_x = 1024) in;
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer V4 { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer U32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer H16 { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer PKH { float16_t v[]; };          // pooled keys fp16
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer PK4 { f16vec4 v[]; };
+layout(push_constant) uniform PC { uint64_t qi; uint64_t rk; uint64_t pk; uint64_t knw; uint64_t sel; uint64_t params; uint t; float eps; float theta;
+                                   uint gmin; uint64_t scr;
+#ifdef WIDE   // S21 wide prefill: grid (1, T): query tok0 + y at position pos0 + tok0 + y (t = 0 semantics: every block completed
+              // before it was pooled into pk by the POOL pass), qi + tok*qis, sel + tok*ss, scratch + y*scrs
+    uint qis; uint ss; uint scrs; uint pos0; uint tok0; uint pad;
+#endif
+} pc;
+// S20: beyond MAXB blocks (or nb > gmin) the scores live in a per-column global scratch (coherent, same arithmetic and the
+// same exact bisection: the selection is identical); contexts up to the model's 262144 positions.
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer SCB { uint v[]; };
+const uint TOPB = 512u;
+shared vec4 qs[4][32];
+shared uint sc[MAXB];
+shared vec4 knew[2][32];        // blocks completed inside this batch (<= 2 for T <= 4)
+shared uint wsum[16], wsum2[16];
+shared uint bcast[2];
+
+#ifdef RADIX
+// S33: the 512th largest score bits by a 3-digit radix select (bits 30..20, 19..9, 8..0: 2048 / 2048 / 512 bins) instead
+// of a 31-step bisection over every score. Scores are >= 0, so their bits order like the values; the bisection's
+// threshold (largest t with #{v >= t} >= 512) IS the 512th largest value, which the digits reach exactly.
+shared uint hist[2048];
+shared uint lsel[TOPB], ltie[1024], lcnt[2];
+uvec2 radix_pick(uint need) {   // hist filled (barrier done): the bin B with #(bins >= B) >= need > #(bins > B), #(bins > B)
+    const uint tid = gl_LocalInvocationID.x, lane = gl_SubgroupInvocationID, wave = gl_SubgroupID;
+    const uint h0 = hist[2u * tid], h1 = hist[2u * tid + 1u];
+    const uint s = h0 + h1;
+    const uint inc = subgroupInclusiveAdd(s);
+    barrier();
+    if (lane == gl_SubgroupSize - 1u) wsum[wave] = inc;
+    barrier();
+    uint off = 0u, tot = 0u;
+    for (uint w = 0u; w < gl_NumSubgroups; ++w) { const uint x = wsum[w]; if (w < wave) off += x; tot += x; }
+    const uint S0 = tot - (off + inc - s), S1 = S0 - h0, S2 = S1 - h1;   // # in bins >= 2t, >= 2t+1, >= 2t+2
+    if (S1 >= need && S2 < need) { bcast[0] = 2u * tid + 1u; bcast[1] = S2; }
+    else if (S0 >= need && S1 < need) { bcast[0] = 2u * tid; bcast[1] = S1; }
+    barrier();
+    return uvec2(bcast[0], bcast[1]);
+}
+#endif
+uint wg_sum(uint v) {           // workgroup sum (16 waves of 64)
+    const uint s = subgroupAdd(v);
+    barrier();
+    if (gl_SubgroupInvocationID == 0u) wsum[gl_SubgroupID] = s;
+    barrier();
+    uint t = 0u;
+    for (uint w = 0u; w < gl_NumSubgroups; ++w) t += wsum[w];
+    return t;
+}
+void main() {
+    const uint tid = gl_LocalInvocationID.x, lane = gl_SubgroupInvocationID, wave = gl_SubgroupID;
+#ifdef WIDE
+    const uint tw = pc.tok0 + gl_WorkGroupID.y;
+    const uint pos = pc.pos0 + tw;
+    U32 S = U32(pc.sel + uint64_t(tw) * uint64_t(pc.ss));
+    const uint64_t qi_a = pc.qi + uint64_t(tw) * uint64_t(pc.qis), scr_a = pc.scr + uint64_t(gl_WorkGroupID.y) * uint64_t(pc.scrs);
+    const uint tpos = pos;
+#else
+    const uint pos = U32(pc.params).v[0];
+    U32 S = U32(pc.sel);
+    const uint64_t qi_a = pc.qi, scr_a = pc.scr;
+    const uint tpos = pos - pc.t;
+#endif
+    const uint nb = (pos + 1u) / 4u;
+    const uint bnew = tpos / 4u;     // blocks >= bnew complete inside this batch (completion position 4b+3 >= tpos)
+    if (tid < 128u) qs[tid >> 5][tid & 31u] = V4(qi_a).v[tid];
+    // ---- pool the in-batch blocks (wave w < 2 handles block bnew + w): lane l holds dims l and l + 64 ----
+    if (wave < 2u && bnew + wave < nb) {
+        const uint b = bnew + wave;
+        H16 R = H16(pc.rk);
+        float a0 = 0.0, a1 = 0.0;
+        for (uint j = 0u; j < 4u; ++j) { const uint rr = ((4u * b + j) & (RKR - 1u)) * 128u; a0 += float(R.v[rr + lane]); a1 += float(R.v[rr + lane + 64u]); }
+        a0 *= 0.25; a1 *= 0.25;
+        const float ss = subgroupAdd(a0 * a0 + a1 * a1);
+        const float inv = inversesqrt(ss / 128.0 + pc.eps);
+        a0 = a0 * inv * (1.0 + F32(pc.knw).v[lane]);
+        a1 = a1 * inv * (1.0 + F32(pc.knw).v[lane + 64u]);
+        // RoPE at position 4b on dims 0..63 (= a0 of every lane): partner of dim l is l + 32 (l < 32) / l - 32
+        const float partner = subgroupShuffleXor(a0, 32u);
+        const uint f = lane & 31u;
+        const float ang = float(4u * b) * pow(pc.theta, -float(2u * f) / 64.0);
+        const float c = cos(ang), sn = sin(ang);
+        a0 = lane < 32u ? a0 * c - partner * sn : a0 * c + partner * sn;
+        a0 = float(float16_t(a0)); a1 = float(float16_t(a1));   // the bits pk stores: in-batch and cached scores agree
+        // to LDS as vec4 rows: dim d -> knew[wave][d / 4][d % 4]
+        knew[wave][lane >> 2][lane & 3u] = a0;
+        knew[wave][(lane + 64u) >> 2][lane & 3u] = a1;
+        if (pos == 4u * b + 3u) {   // this column completes block b: publish it for later queries
+            PKH P = PKH(pc.pk);
+            P.v[b * 128u + lane] = float16_t(a0);
+            P.v[b * 128u + lane + 64u] = float16_t(a1);
+        }
+    }
+    barrier();
+    // (pooling + publishing above runs in the dense regime too: later queries need every block's key)
+    if (nb <= TOPB) { if (tid == 0u) S.v[0] = 0u; return; }
+#ifdef PRESCORED  // S30: idx_score.comp wrote this column's scores to its global scratch (same arithmetic, whole GPU)
+    const bool big = true;
+#else
+    const bool big = nb > MAXB || nb > pc.gmin;
+#endif
+    const uint PER = big ? (nb + 1023u) / 1024u : MAXB / 1024u;
+    SCB G = SCB(scr_a);
+#ifndef PRESCORED
+    // ---- scores ----
+    PK4 P4 = PK4(pc.pk);
+    for (uint b = tid; b < nb; b += 1024u) {
+        float acc[4] = {0.0, 0.0, 0.0, 0.0};
+        if (b < bnew) {
+            for (uint j = 0u; j < 32u; ++j) {
+                const vec4 k = vec4(P4.v[b * 32u + j]);
+                [[unroll]] for (uint h = 0u; h < 4u; ++h) acc[h] += dot(qs[h][j], k);
+            }
+        } else {
+            for (uint j = 0u; j < 32u; ++j) {
+                const vec4 k = knew[b - bnew][j];
+                [[unroll]] for (uint h = 0u; h < 4u; ++h) acc[h] += dot(qs[h][j], k);
+            }
+        }
+        const float s = (max(acc[0], 0.0) + max(acc[1], 0.0) + max(acc[2], 0.0) + max(acc[3], 0.0)) * 0.08838834764831845;
+        if (big) G.v[b] = floatBitsToUint(s); else sc[b] = floatBitsToUint(s);   // s >= 0: the bits order like the values
+    }
+#endif
+    memoryBarrierBuffer();
+    barrier();
+    // ---- threshold = the 512th largest score bits (bisection) ----
+    uint thr;
+#ifdef RADIX
+    if (big) {
+        uint need = TOPB;
+        hist[tid] = 0u; hist[tid + 1024u] = 0u;
+        barrier();
+        for (uint b = tid; b < nb; b += 1024u) atomicAdd(hist[G.v[b] >> 20], 1u);
+        barrier();
+        uvec2 r = radix_pick(need);
+        const uint d1 = r.x;
+        need -= r.y;
+        hist[tid] = 0u; hist[tid + 1024u] = 0u;
+        barrier();
+        for (uint b = tid; b < nb; b += 1024u) { const uint v = G.v[b]; if ((v >> 20) == d1) atomicAdd(hist[(v >> 9) & 2047u], 1u); }
+        barrier();
+        r = radix_pick(need);
+        const uint d12 = (d1 << 11) | r.x;
+        need -= r.y;
+        hist[tid] = 0u; hist[tid + 1024u] = 0u;
+        barrier();
+        for (uint b = tid; b < nb; b += 1024u) { const uint v = G.v[b]; if ((v >> 9) == d12) atomicAdd(hist[v & 511u], 1u); }
+        barrier();
+        r = radix_pick(need);
+        thr = (d12 << 9) | r.x;
+        const uint quota = need - r.y;             // blocks AT the threshold to take (the first ones in block order)
+        // S33 coalesced collection: the blocks above the threshold and the tied ones go to LDS lists (any order), then each
+        // entry's output index is its rank by block index (a broadcast loop over the list: no sort, no barriers), which is
+        // the ordered compaction's output. Heavy ties (> 1024 at the threshold, e.g. many zero scores) take the ordered path.
+        if (tid < 2u) lcnt[tid] = 0u;
+        barrier();
+        for (uint b = tid; b < nb; b += 1024u) {
+            const uint v = G.v[b];
+            if (v > thr) lsel[atomicAdd(lcnt[0], 1u)] = b;
+            else if (v == thr) { const uint k = atomicAdd(lcnt[1], 1u); if (k < 1024u) ltie[k] = b; }
+        }
+        barrier();
+        const uint ngt = lcnt[0], ntie = lcnt[1];
+        if (ntie <= 1024u) {
+            if (tid < ntie) {                      // tie rank by block index: the first `quota` are taken
+                const uint b = ltie[tid];
+                uint rk = 0u;
+                for (uint j = 0u; j < ntie; ++j) rk += ltie[j] < b ? 1u : 0u;
+                if (rk < quota) lsel[ngt + rk] = b;
+            }
+            barrier();
+            if (tid < TOPB) {                      // ngt + quota == TOPB entries: output index = rank by block index
+                const uint b = lsel[tid];
+                uint rk = 0u;
+                for (uint j = 0u; j < TOPB; ++j) rk += lsel[j] < b ? 1u : 0u;
+                const uint o = 1u + 4u * rk;
+                S.v[o] = 4u * b; S.v[o + 1u] = 4u * b + 1u; S.v[o + 2u] = 4u * b + 2u; S.v[o + 3u] = 4u * b + 3u;
+            }
+            const uint tail0 = 4u * nb;
+            if (tid <= pos - tail0 && tail0 + tid <= pos) S.v[1u + 4u * TOPB + tid] = tail0 + tid;
+            if (tid == 0u) S.v[0] = 4u * TOPB + (pos + 1u - tail0);
+            return;
+        }
+    } else
+#endif
+    {
+    uint lo = 0u, hi = 0x7F800000u;
+    while (lo < hi) {
+        const uint mid = lo + (hi - lo + 1u) / 2u;
+        uint c = 0u;
+        if (big) { for (uint b = tid; b < nb; b += 1024u) c += G.v[b] >= mid ? 1u : 0u; }
+        else for (uint b = tid; b < nb; b += 1024u) c += sc[b] >= mid ? 1u : 0u;
+        if (wg_sum(c) >= TOPB) lo = mid; else hi = mid - 1u;
+    }
+    thr = lo;
+    }
+    // ---- ordered compaction: thread tid owns blocks [tid * PER, tid * PER + PER) ----
+    uint ngt = 0u, neq = 0u;
+    for (uint j = 0u; j < PER; ++j) {
+        const uint b = tid * PER + j;
+        if (b < nb) { const uint v = big ? G.v[b] : sc[b]; ngt += v > thr ? 1u : 0u; neq += v == thr ? 1u : 0u; }
+    }
+    const uint tot_gt = wg_sum(ngt);
+    // exclusive prefix of (ngt, neq) over threads in index order
+    const uint pg = subgroupExclusiveAdd(ngt), pe = subgroupExclusiveAdd(neq);
+    const uint sg = subgroupAdd(ngt), se = subgroupAdd(neq);
+    barrier();
+    if (lane == 0u) { wsum[wave] = sg; wsum2[wave] = se; }
+    barrier();
+    uint og = 0u, oe = 0u;
+    for (uint w = 0u; w < wave; ++w) { og += wsum[w]; oe += wsum2[w]; }
+    uint eq_before = oe + pe;
+    const uint quota = TOPB - tot_gt;          // ties taken in block order
+    // output index of a selected block = (# selected blocks before it)
+    uint before = og + pg + min(eq_before, quota);
+    for (uint j = 0u; j < PER; ++j) {
+        const uint b = tid * PER + j;
+        if (b >= nb) break;
+        const uint v = big ? G.v[b] : sc[b];
+        bool take = v > thr;
+        if (!take && v == thr) { take = eq_before < quota; ++eq_before; }
+        if (take) {
+            const uint o = 1u + 4u * before;
+            S.v[o] = 4u * b; S.v[o + 1u] = 4u * b + 1u; S.v[o + 2u] = 4u * b + 2u; S.v[o + 3u] = 4u * b + 3u;
+            ++before;
+        }
+    }
+    const uint tail0 = 4u * nb;
+    if (tid <= pos - tail0 && tail0 + tid <= pos) S.v[1u + 4u * TOPB + tid] = tail0 + tid;
+    if (tid == 0u) S.v[0] = 4u * TOPB + (pos + 1u - tail0);
+}

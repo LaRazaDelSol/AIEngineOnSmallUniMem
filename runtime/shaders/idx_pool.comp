@@ -1,0 +1,50 @@
+#version 460
+// S21 wide prefill: the QSA indexer's pooled block keys for every block COMPLETED inside a slice (completion position 4b+3
+// in [pos0, pos0 + T)), before any query of the slice selects: key_b = RoPE_{4b}(RMSNorm_{1+w}(mean of the 4 raw keys))
+// -> pk[b] (fp16 since the KV-footprint change; was fp32). The arithmetic is idx_select.comp's in-batch pooling (one wave64 per block, lane l = dims l, l + 64), so
+// a query that completes block b and pools it again writes the same bits. Grid (blocks), b = b0 + workgroup.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#ifndef RKR
+#define RKR 1024u   // S30: rk ring positions (flash_engine.hpp kRkRing)
+#endif
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32 { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer H16 { float16_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) buffer PKH { float16_t v[]; };  // pooled keys, fp16 (KV-footprint work)
+#ifdef PARAMS  // S30 MTP KV fill (pre-recorded, one position p from params): pools block p / 4 when p completes it
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer U32P { uint v[]; };
+layout(push_constant) uniform PC { uint64_t rk; uint64_t pk; uint64_t knw; uint64_t params; float eps; float theta; } pc;
+#else
+layout(push_constant) uniform PC { uint64_t rk; uint64_t pk; uint64_t knw; uint b0; uint pos0; uint T; float eps; float theta; uint pad; } pc;
+#endif
+void main() {
+#ifdef PARAMS
+    const uint lane = gl_SubgroupInvocationID, p = U32P(pc.params).v[0], b = p / 4u;
+    if (p != 4u * b + 3u) return;
+#else
+    const uint lane = gl_SubgroupInvocationID, b = pc.b0 + gl_WorkGroupID.x;
+    const uint c = 4u * b + 3u;
+    if (c < pc.pos0 || c >= pc.pos0 + pc.T) return;
+#endif
+    H16 R = H16(pc.rk);
+    float a0 = 0.0, a1 = 0.0;
+    for (uint j = 0u; j < 4u; ++j) { const uint rr = ((4u * b + j) & (RKR - 1u)) * 128u; a0 += float(R.v[rr + lane]); a1 += float(R.v[rr + lane + 64u]); }
+    a0 *= 0.25; a1 *= 0.25;
+    const float ss = subgroupAdd(a0 * a0 + a1 * a1);
+    const float inv = inversesqrt(ss / 128.0 + pc.eps);
+    a0 = a0 * inv * (1.0 + F32(pc.knw).v[lane]);
+    a1 = a1 * inv * (1.0 + F32(pc.knw).v[lane + 64u]);
+    const float partner = subgroupShuffleXor(a0, 32u);
+    const uint f = lane & 31u;
+    const float ang = float(4u * b) * pow(pc.theta, -float(2u * f) / 64.0);
+    const float cs = cos(ang), sn = sin(ang);
+    a0 = lane < 32u ? a0 * cs - partner * sn : a0 * cs + partner * sn;
+    PKH P = PKH(pc.pk);
+    P.v[b * 128u + lane] = float16_t(a0);
+    P.v[b * 128u + lane + 64u] = float16_t(a1);
+}

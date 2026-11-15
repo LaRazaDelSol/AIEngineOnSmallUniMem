@@ -1,0 +1,39 @@
+#version 460
+// S21 wide prefill: PS5Q4 rows x T tokens for TINY row counts (HC inject N=4, shared-expert gate N=1), where a 128-row
+// GEMM tile is ~all waste: one workgroup per token, every row reduced over the whole workgroup.
+// y[t][r] = epi(alpha * W[r] . x[t]); mode 0 store, 1 accumulate, 2 silu, 3 sigmoid. Grid (T).
+#define BITS 4
+#include "common.glsl"
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC { uint64_t w; uint64_t x; uint64_t y; uint K; uint N; uint mode; float alpha; uint xs; uint ys; } pc;
+shared float part[8];
+void main() {
+    const uint t = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+    const uint SW = scale_words(pc.K), RW = row_words(pc.K), QW = quant_words(pc.K);
+    U32 W = U32(pc.w);
+    V4 X = V4(pc.x + uint64_t(t) * uint64_t(pc.xs));
+    F32 Y = F32(pc.y + uint64_t(t) * uint64_t(pc.ys));
+    for (uint r = 0u; r < pc.N; ++r) {
+        const uint rb = r * RW;
+        float acc = 0.0;
+        for (uint w = tid; w < QW; w += 256u) {
+            float xv[16];
+            float sx;
+            load_x(X, w, xv, sx);
+            acc += block_scale(W, rb, w) * word_dot(W.v[rb + SW + w], xv, sx);
+        }
+        acc = subgroupAdd(acc);
+        barrier();
+        if (gl_SubgroupInvocationID == 0u) part[gl_SubgroupID] = acc;
+        barrier();
+        if (tid == 0u) {
+            float a = 0.0;
+            for (uint i = 0u; i < gl_NumSubgroups; ++i) a += part[i];
+            a *= pc.alpha;
+            float o = a;
+            if (pc.mode == 2u) o = a / (1.0 + exp(-a));
+            else if (pc.mode == 3u) o = 1.0 / (1.0 + exp(-a));
+            if (pc.mode == 1u) Y.v[r] += o; else Y.v[r] = o;
+        }
+    }
+}
